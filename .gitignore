@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+/build/
+/dist/
+/verification/
+/screenshots/
+*.log
+
+# Measurement files can contain proprietary device data.
+*.[sS][0-9]*[pP]
+*.[sS][nN][pP]
+*.[tT][sS]
+!/tests/fixtures/**/*.[sS][0-9]*[pP]
+!/tests/fixtures/**/*.[sS][nN][pP]
+!/tests/fixtures/**/*.[tT][sS]
