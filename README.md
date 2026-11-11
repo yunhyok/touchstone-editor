@@ -7,7 +7,7 @@ PowerSI에서 만든 Touchstone 파일을 Ansys용 포트 주석으로 변환하
 
 ## 설치
 
-1. [최신 릴리스](https://github.com/yunhyok/touchstone-editor/releases/latest)에서 `Touchstone-Editor-Setup-v1.2.0-x64.exe` 다운로드.
+1. [최신 릴리스](https://github.com/yunhyok/touchstone-editor/releases/latest)에서 `Touchstone-Editor-Setup-v1.2.1-x64.exe` 다운로드.
 2. 설치 프로그램 실행. 기본 경로 `C:\Program Files\Touchstone Editor`.
 3. 설치 경로 화면에서 다른 드라이브·폴더 선택 가능.
 4. 시작 메뉴의 **Touchstone Editor** 실행.
@@ -87,7 +87,8 @@ Windows 10 1809 이상 / Windows 11 x64용. Python 별도 설치 불필요. 설�
 - 잘린 수치 데이터·지원하지 않는 형식·변경이 감지된 원본은 저장 중단.
 - 원본의 파일 ID·크기·수정 시각과 읽은 헤더 해시로 변경 감지. 동일 ID·크기·수정 시각을 유지한 수치 데이터 변경은 감지 불가. 편집 중 원본을 다른 프로그램에서 수정하지 말 것.
 - 순서·이름 변경 시 기존 연결에 종속된 PowerSI 보조 포트/NETSLIST 및 `!.DiffChannels` 블록 제거. 기본 주석 변환에서는 해당 블록 보존.
-- 순서 변경 시 수치 데이터 사이·이후의 주석 제거. 행 위치에 종속된 설명의 잘못된 연결 방지.
+- 순서 변경 시 HFSS `Gamma`·`Port Impedance`의 포트별 복소수 쌍도 재배열. 숫자 표기와 주파수 연결 유지.
+- 순서 변경 시 수치 데이터 사이·이후의 나머지 주석 제거. 행 위치에 종속된 설명의 잘못된 연결 방지.
 - 중복 이름 허용. 포트 번호로 구분되므로 미리보기에서 중복 여부 확인 필요.
 
 ## 지원 범위와 검증 경계
@@ -97,11 +98,13 @@ Touchstone 2.x, 혼합 모드, 압축 삼각 행렬, 잡음 데이터는 지원�
 지원하지 않는 파일은 자동 추정 변환하지 않고 오류로 표시.
 포트 번호는 파일 앞쪽의 `! Port N =` 또는 `! Port[N] =` 주석 기준. PowerSI 보조 `PortN_...::`의 번호는 행렬 순서로 사용하지 않음.
 포트 정보가 수치 데이터 뒤에 나오는 파일과 옵션 줄이 여러 개인 파일은 지원하지 않음.
-HFSS `Gamma` / `Port Impedance` 확장 주석이 있으면 이름 변경만 지원. 포트 재배열은 중단.
+HFSS `Gamma` / `Port Impedance` 확장 주석은 완전한 주파수 지점 뒤에 각 항목이 **한 줄에 포트 수 × 2개의 숫자**로 기록된 형식의 재배열 지원.
+여러 줄로 나뉜 블록, 전체 임피던스 행렬, 불완전하거나 수치 데이터와 같은 줄에 있는 확장 주석은 재배열 중단. 이름만 변경할 때는 원래 주석 보존.
 단일 물리적 줄은 최대 16MiB 지원.
 
 제공된 PowerSI/Ansys 80포트 참조 파일의 포트 주석 변환 규칙과 수치 데이터 일치를 기준으로 구현.
 v1.1.0 추가 검증: 256·505포트 예제 6개의 선두 헤더만 읽어 포트명 2,034개 확인. 추가 예제의 수치 데이터 본문은 읽거나 변환하지 않음.
+v1.2.1 오류 수정 검증: Circuit Design 2023.2에서 내보낸 260포트 파일을 채널명 순으로 정렬·저장. 560개 주파수의 행렬 37,856,000개 복소수 항목과 Gamma·임피던스 값을 원본과 대조하여 재배열 및 숫자 문자열 보존 확인.
 행렬 재배열·숫자 문자열 보존·잘린 파일 거부·취소 시 출력 보존은 합성 데이터로 검사.
 **Ansys Circuit Designer에서의 실제 가져오기 검증은 별도 필요.**
 측정 원본과 사용자 장치 정보는 공개 저장소에 포함하지 않음.
@@ -120,12 +123,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
 파일을 지정해 실행 가능: `python run_app.py "D:\example.s4p"`.
-빌드 결과: `dist/Touchstone-Editor-Setup-v1.2.0-x64.exe`.
+빌드 결과: `dist/Touchstone-Editor-Setup-v1.2.1-x64.exe`.
 아이콘 재생성: `python scripts/make_icon.py`.
 GitHub Actions에서 테스트·Windows 빌드 수행. `v1.0.0` 형식의 태그로 릴리스 생성.
 
 ## 참고
 
 - [IBIS Touchstone 공식 규격](https://ibis.org/touchstone_ver2.1/touchstone_ver2_1.pdf)
+- [Ansys Gamma·임피던스 확장 주석 설명](https://ansyshelp.ansys.com/public/Views/Secured/Electronics/v242/en/Subsystems/HFSS3DLayout/Content/ReportsandPostProc/ExportingMatrixData.htm)
 - 앱: [MIT License](LICENSE)
 - Qt 및 배포 런타임: [Third-party notices](THIRD_PARTY_NOTICES.md)

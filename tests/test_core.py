@@ -282,17 +282,78 @@ class TouchstoneTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"existing output")
         self.assertEqual(set(self.directory.iterdir()), {source, target})
 
-    def test_hfss_impedance_comments_preserved_or_reorder_rejected(self):
+    def test_hfss_impedance_comments_preserved_or_reordered(self):
         data = matrix_bytes(2) + b"! Port Impedance 45 0 75 0\n! Gamma 1 0 2 0\n"
         source = self.source(2, b"# Hz S RI R 50\n" + data)
         document = read_touchstone(source)
         target = self.target(2)
         export_touchstone(document, document.ports, target)
         self.assertTrue(target.read_bytes().endswith(data))
-        previous = target.read_bytes()
-        with self.assertRaisesRegex(ValueError, "HFSS"):
-            export_touchstone(document, list(reversed(document.ports)), target)
-        self.assertEqual(target.read_bytes(), previous)
+        export_touchstone(document, list(reversed(document.ports)), target)
+        self.assertTrue(target.read_bytes().endswith(b"! Port Impedance 75 0 45 0\n! Gamma 2 0 1 0\n"))
+
+    def test_hfss_vectors_follow_matrix_order_and_frequency(self):
+        for count, order in ((2, [1, 0]), (3, [2, 0, 1])):
+            with self.subTest(count=count):
+                data = bytearray()
+                expected_blocks = []
+                original_points = []
+                for frequency in (b"1e+0", b"2.00"):
+                    matrix = matrix_bytes(count, frequency).replace(b"\n", b"\r\n")
+                    original_points.append(matrix.split())
+                    if frequency == b"2.00":
+                        matrix = matrix.replace(b"\r\n", b" ! 2026\r\n", 1)
+                    data.extend(matrix)
+                    block = []
+                    for label in (b"! Gamma", b"! Port Impedance"):
+                        pairs = [b"+" + frequency + b" -." + str(i + 1).encode() + b"E-3" for i in range(count)]
+                        data.extend(label + b"\t" + b"\t".join(pairs) + b"\r\n")
+                        block.append(label + b" " + b" ".join(pairs[i] for i in order))
+                    expected_blocks.append(block)
+                source = self.source(count, b"# GHz S MA R 50\r\n" + data)
+                document = read_touchstone(source)
+                target = self.target(count)
+                export_touchstone(document, document.ports, target)
+                self.assertTrue(target.read_bytes().endswith(data))
+                export_touchstone(document, [document.ports[i] for i in order], target)
+                lines = target.read_bytes().splitlines()[count + 1:]
+                for point_number in range(2):
+                    row_count = 1 if count == 2 else count
+                    offset = point_number * (row_count + 2)
+                    actual = b" ".join(lines[offset:offset + row_count]).split()
+                    original = original_points[point_number]
+                    axes = [(r, c) for c in order for r in order] if count == 2 else [(r, c) for r in order for c in order]
+                    expected = [original[0]]
+                    for row, column in axes:
+                        cell = column * count + row if count == 2 else row * count + column
+                        expected.extend(original[1 + 2 * cell:3 + 2 * cell])
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(lines[offset + row_count:offset + row_count + 2], expected_blocks[point_number])
+                self.assertEqual(document.point_count, 2)
+
+    def test_hfss_unsupported_metadata_rejected_without_replacing_output(self):
+        matrix = matrix_bytes(3)
+        valid = b"! Port Impedance 50 0 60 0 70 0\n"
+        cases = [
+            valid + matrix,
+            matrix + b"! Gamma 1 0 2 0\n",
+            matrix + b"! Gamma 1 0 NaN 0 3 0\n",
+            matrix + valid + b"! 1 0 2 0 3 0\n",
+            matrix + valid + b"! 1 0 Inf 0 3 0\n",
+            matrix + valid + b"! NaN 0 2 0 3 0\n",
+            matrix + b"! Port Impedance " + b"50 0 " * 9 + b"\n",
+            matrix.replace(b"\n", b"\n" + valid, 1),
+            matrix.rstrip(b"\n") + b" " + valid,
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                document = read_touchstone(self.source(3, b"#\n" + body))
+                target = self.target(3)
+                target.write_bytes(b"existing output")
+                with self.assertRaisesRegex(ValueError, "HFSS"):
+                    export_touchstone(document, list(reversed(document.ports)), target)
+                self.assertEqual(target.read_bytes(), b"existing output")
+                self.assertEqual(list(self.directory.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

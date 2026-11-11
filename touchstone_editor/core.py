@@ -328,11 +328,12 @@ def _write_point(output, point, order, newline):
     output.write(point[0] + b" " + (newline + b"\t").join(rows) + newline)
 
 
-def _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline):
+def _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline, point_complete):
     names_written = False
     in_data = False
     option_written = False
     in_diff_channels = False
+    after_port_values = False
     for line_number, raw in enumerate(raw_lines, 1):
         if line_number == 1 and raw.startswith(_BOM):
             output.write(_BOM)
@@ -341,6 +342,14 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
         if line_ending:
             newline[0] = line_ending
         code, comment = _parts(raw)
+        if changed_order and after_port_values and not code and comment:
+            try:
+                continuation = [float(token) for token in comment[1:].split()]
+            except ValueError:
+                continuation = []
+            if continuation:
+                raise ValueError(f"Line {line_number}: wrapped HFSS Gamma/Port Impedance blocks are unsupported for reordering.")
+        after_port_values = False
         if comment or in_diff_channels:
             previous_state = in_diff_channels
             in_diff_channels = _diff_channel_state(code, comment, in_diff_channels, line_number)
@@ -355,9 +364,18 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             if option_written:
                 raise ValueError(f"Line {line_number}: multiple option lines are unsupported.")
             option_written = True
-        if changed_order and comment and _PORT_VALUES.match(comment):
-            raise ValueError("Port reordering with HFSS Gamma/Port Impedance extensions is unsupported. "
-                             "Name-only export preserves these comments.")
+        port_values = _PORT_VALUES.match(comment) if changed_order and comment else None
+        if port_values:
+            payload = comment[port_values.end():].strip()
+            values = payload.split()
+            if (code or not in_data or not point_complete[0]
+                    or len(values) != 2 * len(order) or not _NUMERIC_LINE.fullmatch(payload)):
+                raise ValueError(f"Line {line_number}: HFSS Gamma/Port Impedance requires one standalone line "
+                                 f"with {2 * len(order)} numeric values after a complete frequency point.")
+            reordered = [value for index in order for value in values[2 * index:2 * index + 2]]
+            output.write(comment[:port_values.end()] + b" " + b" ".join(reordered) + line_ending)
+            after_port_values = True
+            continue
         is_data = bool(code) and not is_option
         is_port = bool(comment and _PORT.fullmatch(comment))
         if is_port and (in_data or is_data):
@@ -375,6 +393,7 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             in_data = True
             if not changed_order:
                 output.write(raw)
+            point_complete[0] = False
             yield line_number, code
             continue
         if changed_order and in_data:
@@ -416,6 +435,8 @@ def export_touchstone(document, ports, target, progress=None, cancel=None):
     newline = [b"\n"]
     temporary_path = None
     point_count = 0
+    # The metadata writer must wait for the matrix parser to finish each frequency point.
+    point_complete = [True]
     try:
         with source.open("rb") as stream:
             _check_source(source, document._stamp, stream)
@@ -423,11 +444,12 @@ def export_touchstone(document, ports, target, progress=None, cancel=None):
             with tempfile.NamedTemporaryFile(mode="wb", dir=target.parent, suffix=".tmp", delete=False) as output:
                 temporary_path = Path(output.name)
                 raw_lines = _lines(stream, document, progress, cancel)
-                lines = _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline)
+                lines = _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline, point_complete)
                 for point in _points(lines, port_count, collect=changed_order):
                     if changed_order:
                         _write_point(output, point, order, newline[0])
                     point_count += 1
+                    point_complete[0] = True
                 if not point_count:
                     raise ValueError("The file contains no S-parameter data.")
                 _check_source(source, document._stamp, stream)
