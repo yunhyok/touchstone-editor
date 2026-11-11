@@ -234,15 +234,17 @@ class MainWindow(QMainWindow):
         self.scope = QComboBox()
         self.scope.addItems(["전체 포트", "선택한 포트"])
         self.operation = QComboBox()
-        for label, value in [("찾아 바꾸기", "replace"), ("지정 문자 삭제", "delete"),
+        for label, value in [("찾아 바꾸기", "replace"), ("정규식 찾아 바꾸기", "regex"),
+                             ("지정 문자 삭제", "delete"),
                              ("구분자 앞부분만 유지", "before"), ("구분자 뒷부분만 유지", "after"),
                              ("부품 정보 제거 · 채널만", "channel")]:
             self.operation.addItem(label, value)
         self.find_text = QLineEdit()
         self.find_text.setPlaceholderText("문자열 또는 구분자")
-        self.find_text.setToolTip("일반 문자열 기준 · 정규식 미지원")
+        self.find_text.setToolTip("정규식 작업 예: ^SITE([0-9]+)-(.*)$")
         self.replacement = QLineEdit()
         self.replacement.setPlaceholderText("비워 두면 삭제")
+        self.replacement.setToolTip("정규식 그룹 사용: $1, $2 · 번호를 뒤로 이동: $2/$1 · 달러 기호: $$")
         self.prefix = QLineEdit()
         self.suffix = QLineEdit()
         self.whitespace = QCheckBox("모든 공백 삭제")
@@ -320,14 +322,15 @@ class MainWindow(QMainWindow):
                        for index in self.table.selectionModel().selectedRows()})
 
     def restore_selection(self, source_indices):
-        from PySide6.QtCore import QItemSelectionModel
+        from PySide6.QtCore import QItemSelection, QItemSelectionModel
         selection = self.table.selectionModel()
-        selection.clearSelection()
+        batch = QItemSelection()
         for row, port in enumerate(self.model.ports):
             if port.source_index in source_indices:
                 index = self.proxy.mapFromSource(self.model.index(row, 0))
                 if index.isValid():
-                    selection.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                    batch.select(index, index)
+        selection.select(batch, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
         selected = selection.selectedRows()
         if selected:
             self.table.scrollTo(selected[0])
@@ -402,7 +405,19 @@ class MainWindow(QMainWindow):
     def refresh_preview(self, *args):
         if not hasattr(self, "preview"):
             return
-        ports, changed = self.name_changes()
+        operation = self.operation.currentData()
+        self.find_text.setEnabled(operation != "channel")
+        self.replacement.setEnabled(operation in ("replace", "regex"))
+        self.selection_label.setText(f"{self.proxy.rowCount()} / {len(self.model.ports)}개 표시  ·  "
+                                     f"{len(self.selected_rows())}개 선택" +
+                                     ("  ·  수동 이동은 검색 해제 후 가능" if self.search.text() else ""))
+        try:
+            ports, changed = self.name_changes()
+        except ValueError as error:
+            self.preview.setRowCount(0)
+            self.preview_label.setText(str(error))
+            self.apply_button.setEnabled(False)
+            return
         self.preview.setRowCount(min(len(changed), 80))
         for row, values in enumerate(changed[:80]):
             for column, value in enumerate(values):
@@ -422,16 +437,10 @@ class MainWindow(QMainWindow):
             message += "\n같은 이름이 있습니다. 포트 번호로 구분됩니다."
         self.preview_label.setText(message)
         self.apply_button.setEnabled(bool(changed) and valid and self.job is None)
-        self.selection_label.setText(f"{self.proxy.rowCount()} / {len(ports)}개 표시  ·  "
-                                     f"{len(self.selected_rows())}개 선택" +
-                                     ("  ·  수동 이동은 검색 해제 후 가능" if self.search.text() else ""))
-        operation = self.operation.currentData()
-        self.find_text.setEnabled(operation != "channel")
-        self.replacement.setEnabled(operation == "replace")
 
     def apply_names(self):
-        ports, changed = self.name_changes()
         try:
+            ports, changed = self.name_changes()
             validate_names([port.name for port in ports])
         except ValueError as error:
             self.show_error(str(error))
@@ -478,7 +487,7 @@ class MainWindow(QMainWindow):
                                                   "Touchstone (*.s*p *.S*P);;모든 파일 (*)")
         if path:
             self.start_job(lambda progress, cancel: read_touchstone(path, progress, cancel),
-                           self.load_document, "파일 검사 중…")
+                           self.load_document, "포트 헤더 읽는 중…")
 
     def load_document(self, document):
         self.document = document
@@ -487,9 +496,9 @@ class MainWindow(QMainWindow):
         self.model.set_ports(document.ports)
         self.file_label.setText(str(document.source))
         self.file_label.setToolTip(str(document.source))
-        self.meta_label.setText(f"{document.port_count} ports  ·  {document.point_count:,} 주파수 지점  ·  "
+        self.meta_label.setText(f"{document.port_count} ports  ·  헤더만 읽음  ·  "
                                f"{document.option_line.strip()}")
-        self.statusBar().showMessage("파일 검사 완료 · 채널명을 확인하고 저장하세요.")
+        self.statusBar().showMessage("포트 헤더 읽기 완료 · 수치 데이터는 저장할 때 검사합니다.")
         self.refresh()
 
     def save_file(self):

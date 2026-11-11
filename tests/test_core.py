@@ -43,9 +43,10 @@ class TouchstoneTests(unittest.TestCase):
         document = read_touchstone(self.source(2, header + data))
         self.assertEqual([port.name for port in document.ports], ["SAMPLE/0", "OTHER CHANNEL"])
         self.assertEqual(document.ports[0].original_name, "X4_0-J2 SAMPLE/0")
-        self.assertEqual(document.point_count, 1)
+        self.assertIsNone(document.point_count)
         target = self.target(2)
         export_touchstone(document, document.ports, target)
+        self.assertEqual(document.point_count, 1)
         expected = header.replace(b"Port 1 = X4_0-J2", b"Port[1] =").replace(b"Port 2 = U1-A1", b"Port[2] =")
         self.assertEqual(target.read_bytes(), expected + data)
 
@@ -86,30 +87,85 @@ class TouchstoneTests(unittest.TestCase):
                                          values[1 + 2 * old_offset:3 + 2 * old_offset])
 
     def test_partial_options_comments_and_mixed_line_endings(self):
-        source = self.source(1, b"# ma\r1 .5 -12\r\n2 1 0\n! Port[1] = Late name")
+        contents = b"# ma\r! Port[1] = Leading name\r\n1 .5 -12\r\n2 1 0\n"
+        source = self.source(1, contents)
         document = read_touchstone(source)
         self.assertEqual(document.option_line, "# ma")
-        self.assertEqual(document.ports[0].name, "Late name")
-        self.assertEqual(document.point_count, 2)
+        self.assertEqual(document.ports[0].name, "Leading name")
+        self.assertIsNone(document.point_count)
         target = self.target(1)
         export_touchstone(document, document.ports, target)
-        self.assertEqual(target.read_bytes(), b"# ma\r! Port[1] = Late name\r\n1 .5 -12\r\n2 1 0\n")
+        self.assertEqual(document.point_count, 2)
+        self.assertEqual(target.read_bytes(), contents)
 
-    def test_rejects_unsupported_or_malformed_sources(self):
+    def test_open_reads_only_the_header_and_first_body_byte(self):
+        header = b"! Port 1 = PKG-A12 CHANNEL\r\n# Hz S RI R 50\r\n! After option\r\n"
+        source = self.source(1, header + b"1")
+        with source.open("r+b") as stream:
+            stream.seek(32 * 1024 * 1024)
+            stream.write(b"\n")
+        test = self
+        with source.open("rb", buffering=0) as real_stream:
+            class GuardedStream:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return None
+
+                def fileno(self):
+                    return real_stream.fileno()
+
+                def read(self, size):
+                    test.assertGreater(size, 0)
+                    test.assertLessEqual(real_stream.tell() + size, len(header) + 1)
+                    return real_stream.read(size)
+
+            with patch.object(Path, "open", return_value=GuardedStream()) as open_file:
+                document = read_touchstone(source)
+            open_file.assert_called_once_with("rb", buffering=0)
+            self.assertEqual(real_stream.tell(), len(header) + 1)
+        self.assertEqual(document.ports[0].name, "CHANNEL")
+        self.assertIsNone(document.point_count)
+
+    def test_power_prefixes_cleaned_only_for_numbered_names(self):
+        header = (b"! Port 1 = Z9-3K23 SIGNAL1\n! Port 2 = PKG-QB991 SIGNAL2\n"
+                  b"! Port 3 = Net-input description\n! Port[4] = PKG-QB991 SIGNAL4\n#\n")
+        document = read_touchstone(self.source(4, header + matrix_bytes(4)))
+        self.assertEqual([port.name for port in document.ports],
+                         ["SIGNAL1", "SIGNAL2", "Net-input description", "PKG-QB991 SIGNAL4"])
+        self.assertEqual(document.ports[0].original_name, "Z9-3K23 SIGNAL1")
+
+    def test_open_rejects_unsupported_or_malformed_headers(self):
         cases = [
             (1, b"[Version] 2.0\n#\n1 0 0\n", "Touchstone 2.x"),
-            (1, b"1 0 0\n", "expected an option line"),
+            (1, b"1 0 0\n", "Expected an option line"),
             (1, b"# GHz Z RI R 50\n1 0 0\n", "option line"),
             (1, b"# S R -1\n1 0 0\n", "option line"),
             (1, b"# R 1 2\n1 0 0\n", "option line"),
+            (1, b"# MHz\n# GHz\n1 0 0\n", "multiple option lines"),
+            (1, b"! Port[2] = Other\n#\n1 0 0\n", "out-of-range"),
+            (1, b"! Port 1 = \n#\n1 0 0\n", "missing"),
+            (1, b"! Port 1 = First\n! Port[1] = Second\n#\n1 0 0\n", "duplicate"),
+            (1, b"!.DiffChannels\n!.DiffChannels\n#\n", "malformed PowerSI"),
+            (1, b"#\n!.DiffChannels\n1 0 0\n", "missing its end marker"),
+            (1, b"!.EndDiffChannels\n#\n", "malformed PowerSI"),
+        ]
+        for count, contents, error in cases:
+            with self.subTest(contents=contents):
+                with self.assertRaisesRegex(ValueError, error):
+                    read_touchstone(self.source(count, contents))
+
+    def test_save_validates_data_before_replacing_output(self):
+        cases = [
             (1, b"# MHz\n1 0 0\n# GHz\n2 0 0\n", "multiple option lines"),
             (1, b"#\n", "no S-parameter data"),
             (1, b"#\n1 NaN 0\n", "invalid numeric"),
             (1, b"#\n1 2e- 0\n", "invalid numeric"),
             (1, b"#\n+1 1 2\n1.0 3 4\n", "strictly increasing"),
-            (1, b"! Port[2] = Other\n#\n1 0 0\n", "out-of-range"),
-            (1, b"! Port 1 = \n#\n1 0 0\n", "missing"),
-            (1, b"! Port 1 = First\n! Port[1] = Second\n#\n1 0 0\n", "duplicate"),
+            (1, b"#\n1 0 0\n! Port[1] = Late name\n", "must precede"),
+            (1, b"#\n1 0 0 ! Port[1] = Inline name\n", "must precede"),
+            (1, b"#\n1 0 0\n[End]\n", "Touchstone 2.x"),
             (2, b"#\n" + matrix_bytes(2) + b"1 2 3 4 5\n", "noise data"),
             (3, b"#\n1 1 0 2 0 3 0\n", "incomplete S-parameter matrix"),
             (3, b"#\n1 1 0 2 0\n", "incorrect number"),
@@ -117,8 +173,19 @@ class TouchstoneTests(unittest.TestCase):
         ]
         for count, contents, error in cases:
             with self.subTest(contents=contents):
-                with self.assertRaisesRegex(ValueError, error):
-                    read_touchstone(self.source(count, contents))
+                source = self.source(count, contents)
+                document = read_touchstone(source)
+                target = self.target(count)
+                target.write_bytes(b"existing output")
+                orders = [document.ports]
+                if count > 1:
+                    orders.append(list(reversed(document.ports)))
+                for order in orders:
+                    with self.assertRaisesRegex(ValueError, error):
+                        export_touchstone(document, order, target)
+                    self.assertEqual(target.read_bytes(), b"existing output")
+                    self.assertIsNone(document.point_count)
+                    self.assertEqual(list(self.directory.glob("*.tmp")), [])
 
     def test_rejects_invalid_permutations_names_and_target_aliases(self):
         source = self.source(2, b"#\n" + matrix_bytes(2))
@@ -161,13 +228,42 @@ class TouchstoneTests(unittest.TestCase):
         document = read_touchstone(source)
 
         def mutate(percent):
-            if percent == 0:
+            if percent == 99:
+                stamp = source.stat()
                 source.write_bytes(contents.replace(b"+1.00", b"+2.00"))
+                # Windows can give two writes in the same timer tick the same mtime.
+                os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
 
         with self.assertRaisesRegex(ValueError, "source file changed"):
             export_touchstone(document, document.ports, target, progress=mutate)
         self.assertEqual(target.read_bytes(), b"existing output")
         self.assertEqual(set(self.directory.iterdir()), {source, target})
+
+    def test_changed_header_rejected_even_with_matching_file_stamp(self):
+        source = self.source(1, b"! Port[1] = AAA\n#\n" + matrix_bytes(1))
+        document = read_touchstone(source)
+        source.write_bytes(b"! Port[1] = BBB\n#\n" + matrix_bytes(1))
+        document._stamp = read_touchstone(source)._stamp
+        with self.assertRaisesRegex(ValueError, "source header changed"):
+            export_touchstone(document, document.ports, self.target(1))
+        self.assertFalse(self.target(1).exists())
+
+    def test_diff_channel_metadata_retained_for_default_names_and_removed_for_edits(self):
+        block = (b"!.DiffChannels\r\n"
+                 b'!"Pair" "A" "B" "PKG::A" "PKG::B" "0" "1"\r\n'
+                 b"!.EndDiffChannels\r\n")
+        source = self.source(2, block + b"! Port 1 = PKG-A1 A\n! Port[2] = B\n#\n" + matrix_bytes(2))
+        document = read_touchstone(source)
+        target = self.target(2)
+        export_touchstone(document, document.ports, target)
+        self.assertTrue(target.read_bytes().startswith(block))
+        export_touchstone(document, [replace(document.ports[0], name="Changed"), document.ports[1]], target)
+        self.assertNotIn(b".DiffChannels", target.read_bytes())
+        self.assertNotIn(b"PKG::", target.read_bytes())
+        export_touchstone(document, list(reversed(document.ports)), target)
+        self.assertNotIn(b".DiffChannels", target.read_bytes())
+        self.assertNotIn(b"PKG::", target.read_bytes())
+        self.assertEqual([port.name for port in read_touchstone(target).ports], ["B", "A"])
 
     def test_cancellation_and_failed_replace_are_atomic(self):
         source = self.source(2, b"#\n" + matrix_bytes(2))

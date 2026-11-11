@@ -68,6 +68,33 @@ def test_preview_selected_only_apply_and_undo(window):
     assert [p.name for p in window.model.ports] == ["CH10", "CH2", "CH1"]
 
 
+def test_restore_selection_emits_once_and_preserves_mapping(window):
+    from PySide6.QtTest import QSignalSpy
+
+    window.sort_ports(False)
+    spy = QSignalSpy(window.table.selectionModel().selectionChanged)
+    window.restore_selection({1, 3})
+    assert spy.count() == 1
+    assert {window.model.ports[row].source_index for row in window.selected_rows()} == {1, 3}
+
+
+def test_regex_preview_errors_and_selected_undo(window):
+    select(window, 0)
+    window.scope.setCurrentIndex(1)
+    window.operation.setCurrentIndex(window.operation.findData("regex"))
+    window.find_text.setText("[")
+    assert not window.apply_button.isEnabled()
+    assert "정규식" in window.preview_label.text()
+    window.find_text.setText(r"^CH([0-9]+)$")
+    window.replacement.setText("SIGNAL/$1")
+    assert window.preview.item(0, 1).text() == "SIGNAL/10"
+    assert window.apply_button.isEnabled()
+    window.apply_names()
+    assert [p.name for p in window.model.ports] == ["SIGNAL/10", "CH2", "CH1"]
+    window.undo_stack.undo()
+    assert [p.name for p in window.model.ports] == ["CH10", "CH2", "CH1"]
+
+
 def test_filter_edit_updates_correct_source_port(window):
     window.search.setText("CH2")
     assert window.proxy.rowCount() == 1

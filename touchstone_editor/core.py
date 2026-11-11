@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .names import extract_channel_name
+
 
 class CancelledError(Exception):
     """The caller cancelled a load or export."""
@@ -25,10 +27,11 @@ class TouchstoneDocument:
     source: Path
     port_count: int
     ports: list[Port]
-    point_count: int
+    point_count: int | None
     option_line: str
     _stamp: tuple[int, ...] = field(repr=False)
-    _digest: bytes = field(repr=False)
+    _header_size: int = field(repr=False)
+    _header_digest: bytes = field(repr=False)
     _names: tuple[str, ...] = field(repr=False)
 
 
@@ -36,12 +39,14 @@ _SUFFIX = re.compile(r"\.s([1-9][0-9]*)p", re.IGNORECASE)
 _PORT = re.compile(rb"![ \t]*port(?:\[([0-9]+)\]|[ \t]+([0-9]+))[ \t]*=[ \t]*(.*)", re.IGNORECASE)
 _LEGACY_PORT = re.compile(rb"![ \t]*(?:port[0-9]+_|nets?list\b)", re.IGNORECASE)
 _PORT_VALUES = re.compile(rb"![ \t]*(?:port[ \t]+impedance|gamma)\b", re.IGNORECASE)
-_DEVICE = re.compile(r"(?:\S+_[0-9]+-\S+|[A-Za-z]+[0-9]+-[A-Za-z]*[0-9]+)")
+_DIFF_CHANNEL = re.compile(rb"![ \t]*\.(end)?diffchannels\b", re.IGNORECASE)
+_DIFF_ROW = re.compile(rb'![ \t]*(?:"[^"]*"[ \t]*)+')
 _NUMBER = rb"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?"
 _NUMERIC_LINE = re.compile(_NUMBER + rb"(?:[ \t]+" + _NUMBER + rb")*")
 _OPTION_LINE = re.compile(rb"[ \t!-~]+")
 _WHITESPACE = b" \t\r\n"
 _BOM = b"\xef\xbb\xbf"
+_LINE_LIMIT = 16 * 1024 * 1024
 
 
 def _port_count(path):
@@ -58,6 +63,7 @@ def _stamp(stat):
 
 
 def _check_source(source, stamp, stream=None):
+    # shortcut: body edits preserving file identity/size/mtime evade detection; use a snapshot if required.
     if _stamp(source.stat()) != stamp or (stream is not None and _stamp(os.fstat(stream.fileno())) != stamp):
         raise ValueError("The source file changed. Open it again before exporting.")
 
@@ -67,7 +73,51 @@ def _check_cancel(cancel):
         raise CancelledError()
 
 
-def _lines(stream, size, digest, progress, cancel):
+def _header_lines(stream, cancel):
+    # Use an unbuffered stream so opening stops at the first non-header byte.
+    line = bytearray()
+    byte = stream.read(1)
+    if byte == _BOM[:1]:
+        bom = byte + stream.read(2)
+        if bom != _BOM:
+            return
+        line.extend(bom)
+        byte = stream.read(1)
+    prefix = True
+    line_number = 1
+    while byte:
+        if prefix and byte not in b" \t":
+            if byte == b"[":
+                raise ValueError(f"Line {line_number}: Touchstone 2.x keywords are unsupported.")
+            if byte not in b"!#\r\n":
+                return
+            prefix = False
+        line.extend(byte)
+        if byte in (b"\r", b"\n"):
+            following = stream.read(1) if byte == b"\r" else b""
+            if following == b"\n":
+                line.extend(following)
+                following = b""
+            yield bytes(line)
+            _check_cancel(cancel)
+            line.clear()
+            prefix = True
+            line_number += 1
+            byte = following or stream.read(1)
+        else:
+            if len(line) % 4096 == 0:
+                _check_cancel(cancel)
+                if len(line) >= _LINE_LIMIT:
+                    raise ValueError("A Touchstone line exceeds the 16 MiB limit.")
+            byte = stream.read(1)
+    if line:
+        yield bytes(line)
+
+
+def _lines(stream, document, progress, cancel):
+    size = document._stamp[2]
+    header_size = document._header_size
+    digest = hashlib.sha256()
     percent = 0
     if progress is not None:
         progress(percent)
@@ -75,7 +125,10 @@ def _lines(stream, size, digest, progress, cancel):
     tail = b""
     position = 0
     while block := stream.read(256 * 1024):
-        digest.update(block)
+        if position < header_size:
+            digest.update(block[:header_size - position])
+            if position + len(block) >= header_size and digest.digest() != document._header_digest:
+                raise ValueError("The source header changed. Open the file again before exporting.")
         position += len(block)
         current = min(99, 100 * position // max(1, size))
         if progress is not None and current > percent:
@@ -85,18 +138,31 @@ def _lines(stream, size, digest, progress, cancel):
         chunk = tail + block
         lines = chunk.splitlines(keepends=True)
         # shortcut: cap one physical line at 16 MiB, revisit for larger vendor comments.
-        if len(chunk) > 16 * 1024 * 1024 and any(len(line) > 16 * 1024 * 1024 for line in lines):
+        if len(chunk) > _LINE_LIMIT and any(len(line) > _LINE_LIMIT for line in lines):
             raise ValueError("A Touchstone line exceeds the 16 MiB limit.")
         # Keep a final CR until the next block distinguishes CR from CRLF.
         tail = b"" if lines[-1].endswith(b"\n") else lines.pop()
         yield from lines
     if tail:
         yield tail
+    if position < header_size:
+        raise ValueError("The source header changed. Open the file again before exporting.")
 
 
 def _parts(raw):
     code, marker, comment = raw.partition(b"!")
     return code.strip(_WHITESPACE), marker + comment.rstrip(b"\r\n")
+
+
+def _diff_channel_state(code, comment, in_block, line_number):
+    marker = _DIFF_CHANNEL.match(comment)
+    if marker:
+        if code or comment[marker.end():].strip(b" \t") or bool(marker[1]) != in_block:
+            raise ValueError(f"Line {line_number}: malformed PowerSI .DiffChannels block.")
+        return not in_block
+    if in_block and (code or not _DIFF_ROW.fullmatch(comment)):
+        raise ValueError(f"Line {line_number}: malformed PowerSI .DiffChannels block.")
+    return in_block
 
 
 def _text(raw):
@@ -187,57 +253,52 @@ def _points(lines, port_count, collect=False):
 
 
 def read_touchstone(path, progress=None, cancel=None):
-    """Validate the source and retain port metadata, never the network matrices."""
+    """Read leading metadata without consuming the numeric records."""
     path = Path(path)
     port_count = _port_count(path)
     source = path.resolve(strict=True)
     option_line = ""
     ports = {}
     digest = hashlib.sha256()
-
-    def network_lines(raw_lines):
-        nonlocal option_line
-        for line_number, raw in enumerate(raw_lines, 1):
+    header_size = 0
+    in_diff_channels = False
+    if progress is not None:
+        progress(0)
+    _check_cancel(cancel)
+    with source.open("rb", buffering=0) as stream:
+        stamp = _stamp(os.fstat(stream.fileno()))
+        for line_number, raw in enumerate(_header_lines(stream, cancel), 1):
+            header_size += len(raw)
+            digest.update(raw)
             if line_number == 1:
                 raw = raw.removeprefix(_BOM)
             code, comment = _parts(raw)
+            in_diff_channels = _diff_channel_state(code, comment, in_diff_channels, line_number)
             match = _PORT.fullmatch(comment)
             if match:
                 index = int(match[1] or match[2])
                 if not 1 <= index <= port_count or index in ports or not match[3].strip():
                     raise ValueError(f"Line {line_number}: missing, duplicate or out-of-range port name.")
                 original = _text(match[3].strip())
-                name = original
-                first, *rest = original.split(maxsplit=1)
-                if match[2] and rest and _DEVICE.fullmatch(first):
-                    name = rest[0]
+                name = extract_channel_name(original) if match[2] else original
                 ports[index] = Port(index, name, original)
-            if code.startswith(b"["):
-                raise ValueError(f"Line {line_number}: Touchstone 2.x keywords are unsupported.")
             if code.startswith(b"#"):
                 if option_line:
                     raise ValueError(f"Line {line_number}: multiple option lines are unsupported.")
                 _option_references(code, port_count, line_number)
                 option_line = code.decode("ascii")
-            elif code:
-                if not option_line:
-                    raise ValueError(f"Line {line_number}: expected an option line before the network data.")
-                yield line_number, code
-
-    with source.open("rb") as stream:
-        stamp = _stamp(os.fstat(stream.fileno()))
-        raw_lines = _lines(stream, stamp[2], digest, progress, cancel)
-        point_count = sum(1 for _ in _points(network_lines(raw_lines), port_count))
         _check_cancel(cancel)
         _check_source(source, stamp, stream)
-    if not point_count:
-        raise ValueError("The file contains no S-parameter data.")
+    if in_diff_channels:
+        raise ValueError("The PowerSI .DiffChannels block is missing its end marker.")
+    if not option_line:
+        raise ValueError("Expected an option line before the network data.")
     port_list = [ports.get(index, Port(index, f"Port {index}", f"Port {index}"))
                  for index in range(1, port_count + 1)]
     if progress is not None:
         progress(100)
-    return TouchstoneDocument(source, port_count, port_list, point_count, option_line,
-                              stamp, digest.digest(), tuple(port.name for port in port_list))
+    return TouchstoneDocument(source, port_count, port_list, None, option_line,
+                              stamp, header_size, digest.digest(), tuple(port.name for port in port_list))
 
 
 def _check_target(target, source):
@@ -270,6 +331,8 @@ def _write_point(output, point, order, newline):
 def _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline):
     names_written = False
     in_data = False
+    option_written = False
+    in_diff_channels = False
     for line_number, raw in enumerate(raw_lines, 1):
         if line_number == 1 and raw.startswith(_BOM):
             output.write(_BOM)
@@ -278,11 +341,27 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
         if line_ending:
             newline[0] = line_ending
         code, comment = _parts(raw)
+        if comment or in_diff_channels:
+            previous_state = in_diff_channels
+            in_diff_channels = _diff_channel_state(code, comment, in_diff_channels, line_number)
+            if previous_state or in_diff_channels:
+                if not changed_order and not changed_names:
+                    output.write(raw)
+                continue
+        if code.startswith(b"["):
+            raise ValueError(f"Line {line_number}: Touchstone 2.x keywords are unsupported.")
+        is_option = code.startswith(b"#")
+        if is_option:
+            if option_written:
+                raise ValueError(f"Line {line_number}: multiple option lines are unsupported.")
+            option_written = True
         if changed_order and comment and _PORT_VALUES.match(comment):
             raise ValueError("Port reordering with HFSS Gamma/Port Impedance extensions is unsupported. "
                              "Name-only export preserves these comments.")
-        is_data = bool(code) and not code.startswith(b"#")
+        is_data = bool(code) and not is_option
         is_port = bool(comment and _PORT.fullmatch(comment))
+        if is_port and (in_data or is_data):
+            raise ValueError(f"Line {line_number}: numbered port names must precede the network data.")
         if not names_written and (is_port or is_data):
             for index, name in enumerate(names, 1):
                 output.write(f"! Port[{index}] = {name}".encode("utf-8") + newline[0])
@@ -294,12 +373,13 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             raw = raw.split(b"!", 1)[0].rstrip(b" \t") + line_ending
         if is_data:
             in_data = True
-            if changed_order:
-                yield line_number, code
-                continue
+            if not changed_order:
+                output.write(raw)
+            yield line_number, code
+            continue
         if changed_order and in_data:
             continue
-        if changed_order and code.startswith(b"#"):
+        if changed_order and is_option:
             reference = _option_references(code, len(order), line_number)
             if reference is not None:
                 start, tokens = reference
@@ -308,6 +388,8 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
                     raw += b" " + comment
                 raw += line_ending
         output.write(raw)
+    if in_diff_channels:
+        raise ValueError("The PowerSI .DiffChannels block is missing its end marker.")
 
 
 def export_touchstone(document, ports, target, progress=None, cancel=None):
@@ -333,23 +415,21 @@ def export_touchstone(document, ports, target, progress=None, cancel=None):
     changed_names = tuple(names) != document._names
     newline = [b"\n"]
     temporary_path = None
+    point_count = 0
     try:
         with source.open("rb") as stream:
             _check_source(source, document._stamp, stream)
             _check_cancel(cancel)
             with tempfile.NamedTemporaryFile(mode="wb", dir=target.parent, suffix=".tmp", delete=False) as output:
                 temporary_path = Path(output.name)
-                digest = hashlib.sha256()
-                raw_lines = _lines(stream, document._stamp[2], digest, progress, cancel)
+                raw_lines = _lines(stream, document, progress, cancel)
                 lines = _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline)
-                if changed_order:
-                    for point in _points(lines, port_count, collect=True):
+                for point in _points(lines, port_count, collect=changed_order):
+                    if changed_order:
                         _write_point(output, point, order, newline[0])
-                else:
-                    for _ in lines:
-                        pass
-                if digest.digest() != document._digest:
-                    raise ValueError("The source file changed. Open it again before exporting.")
+                    point_count += 1
+                if not point_count:
+                    raise ValueError("The file contains no S-parameter data.")
                 _check_source(source, document._stamp, stream)
                 output.flush()
                 os.fsync(output.fileno())
@@ -357,6 +437,7 @@ def export_touchstone(document, ports, target, progress=None, cancel=None):
         _check_source(source, document._stamp)
         _check_target(target, source)
         os.replace(temporary_path, target)
+        document.point_count = point_count
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
