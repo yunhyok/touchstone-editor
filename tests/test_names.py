@@ -65,3 +65,29 @@ def test_regex_backtracking_limit_never_returns_partial_replacement():
     rule = NameRule(operation="regex", find=r"(*NO_START_OPT)CH[0-9]+|\G(.*)+X", replacement="changed")
     with pytest.raises(ValueError, match="한도"):
         rule.apply("CH1" + "A" * 30)
+
+
+@pytest.mark.parametrize("start,end,replacement,expected", [
+    (1, 3, "", "DEFG"),
+    (2, 4, "_", "A_EFG"),
+    (3, 3, "XYZ", "ABXYZDEFG"),
+    (6, 99, "Z", "ABCDEZ"),
+    (8, 99, "Z", "ABCDEFG"),
+    (1, 99, "", ""),
+    (2, 3, "$1", "A$1DEFG"),
+])
+def test_character_range_is_one_based_inclusive(start, end, replacement, expected):
+    assert NameRule(operation="range", start=start, end=end,
+                    replacement=replacement).apply("ABCDEFG") == expected
+
+
+@pytest.mark.parametrize("start,end", [(0, 1), (-1, 2), (3, 2)])
+def test_character_range_rejects_invalid_positions(start, end):
+    with pytest.raises(ValueError, match="문자 위치"):
+        NameRule(operation="range", start=start, end=end).apply("CHANNEL")
+
+
+def test_character_range_unicode_and_cleanup_pipeline():
+    assert NameRule(operation="range", start=2, end=3, replacement="X").apply("가🧪나Z") == "가XZ"
+    assert NameRule(operation="range", start=2, end=4, replacement=" X ",
+                    whitespace=True, prefix="P_", suffix="_OUT").apply("A-B-C") == "P_AXC_OUT"

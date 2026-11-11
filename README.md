@@ -7,7 +7,7 @@ PowerSI에서 만든 Touchstone 파일을 Ansys용 포트 주석으로 변환하
 
 ## 설치
 
-1. [최신 릴리스](https://github.com/yunhyok/touchstone-editor/releases/latest)에서 `Touchstone-Editor-Setup-v1.1.0-x64.exe` 다운로드.
+1. [최신 릴리스](https://github.com/yunhyok/touchstone-editor/releases/latest)에서 `Touchstone-Editor-Setup-v1.2.0-x64.exe` 다운로드.
 2. 설치 프로그램 실행. 기본 경로 `C:\Program Files\Touchstone Editor`.
 3. 설치 경로 화면에서 다른 드라이브·폴더 선택 가능.
 4. 시작 메뉴의 **Touchstone Editor** 실행.
@@ -23,7 +23,7 @@ Windows 10 1809 이상 / Windows 11 x64용. Python 별도 설치 불필요. 설�
 | 채널명 정렬 | 숫자 순서를 반영한 정렬. `CH2` 다음 `CH10` |
 | 수동 순서 변경 | 단일·다중 선택, 위/아래 이동, 지정 위치 이동 |
 | 개별 이름 편집 | 저장할 채널명 셀 더블클릭 |
-| 일괄 이름 편집 | 찾기/바꾸기, 정규식 치환, 지정 문자 삭제, 구분자 앞/뒤 유지, 부품 정보 제거 |
+| 일괄 이름 편집 | 문자 위치 범위 삭제·치환, 찾기/바꾸기, 정규식 치환, 지정 문자 삭제, 구분자 앞/뒤 유지, 부품 정보 제거 |
 | 이름 정리 | 공백 삭제, 특수문자 삭제, 접두사·접미사 추가 |
 | 적용 전 확인 | 전체 또는 선택 포트 대상 미리보기, 실행 취소/다시 실행 |
 | 대용량 처리 | 열 때 앞쪽 헤더만 읽기. 저장 시 주파수 지점 단위 처리, 진행률·취소 지원 |
@@ -46,6 +46,22 @@ Windows 10 1809 이상 / Windows 11 x64용. Python 별도 설치 불필요. 설�
 특수문자 삭제는 문자·숫자·밑줄(`_`) 유지. 접두사·접미사는 정리 작업 이후 추가.
 이름 앞뒤 공백은 저장 형식에 맞춰 제거. 이름 변경을 적용하면 편집 조건 초기화.
 실행 취소는 `Ctrl+Z`, 다시 실행은 `Ctrl+Y`.
+
+### 문자 위치로 삭제·변경
+
+작업에서 **위치로 삭제 / 바꾸기** 선택. 현재 **저장할 채널명**의 왼쪽 첫 문자를 1로 계산. 시작·끝 위치 모두 포함.
+**바꿀 내용**을 비워 두면 해당 범위 삭제. 문자열을 입력하면 해당 범위 전체를 입력한 문자열로 변경.
+
+| 현재 채널명 | 시작 | 끝 | 바꿀 내용 | 결과 |
+|---|---|---|---|---|
+| `ABC_CHANNEL` | 1 | 4 | 비움 | `CHANNEL` |
+| `ABC_CHANNEL` | 1 | 3 | `DUT` | `DUT_CHANNEL` |
+| `ABCDEFG` | 2 | 4 | `X` | `AXEFG` |
+
+- 끝 위치가 이름 길이를 넘으면 마지막 문자까지 처리. 시작 위치부터 이름 길이를 넘으면 해당 이름의 범위 치환 생략.
+- 공백·특수문자도 위치 계산에 포함. 바이트가 아닌 Unicode 코드 포인트 기준. 한글 완성형과 일반 이모지는 각각 1문자, 결합 문자는 구성 코드 포인트별 계산.
+- 적용 범위는 전체 또는 선택한 포트. 접두사·접미사와 공백·특수문자 정리는 범위 치환 후 적용.
+- 시작보다 작은 끝 위치 또는 빈 이름이 생기는 작업은 적용 차단. **미리보기** 확인 후 적용할 것.
 
 ### 정규식 이름 변경 예시
 
@@ -104,7 +120,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
 파일을 지정해 실행 가능: `python run_app.py "D:\example.s4p"`.
-빌드 결과: `dist/Touchstone-Editor-Setup-v1.1.0-x64.exe`.
+빌드 결과: `dist/Touchstone-Editor-Setup-v1.2.0-x64.exe`.
 아이콘 재생성: `python scripts/make_icon.py`.
 GitHub Actions에서 테스트·Windows 빌드 수행. `v1.0.0` 형식의 태그로 릴리스 생성.
 

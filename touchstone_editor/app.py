@@ -229,12 +229,14 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(8, 0, 0, 0)
         group = QGroupBox("채널명 일괄 편집")
         form = QFormLayout(group)
+        self.name_form = form
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.scope = QComboBox()
         self.scope.addItems(["전체 포트", "선택한 포트"])
         self.operation = QComboBox()
         for label, value in [("찾아 바꾸기", "replace"), ("정규식 찾아 바꾸기", "regex"),
+                             ("위치로 삭제 / 바꾸기", "range"),
                              ("지정 문자 삭제", "delete"),
                              ("구분자 앞부분만 유지", "before"), ("구분자 뒷부분만 유지", "after"),
                              ("부품 정보 제거 · 채널만", "channel")]:
@@ -245,6 +247,15 @@ class MainWindow(QMainWindow):
         self.replacement = QLineEdit()
         self.replacement.setPlaceholderText("비워 두면 삭제")
         self.replacement.setToolTip("정규식 그룹 사용: $1, $2 · 번호를 뒤로 이동: $2/$1 · 달러 기호: $$")
+        self.range_start = QSpinBox()
+        self.range_end = QSpinBox()
+        for field, label in ((self.range_start, "삭제하거나 바꿀 시작 문자 위치"),
+                             (self.range_end, "삭제하거나 바꿀 끝 문자 위치")):
+            field.setRange(1, 16 * 1024 * 1024)
+            field.setSuffix(" 번째")
+            field.setAccessibleName(label)
+            field.setToolTip("현재 채널명의 왼쪽 첫 문자가 1입니다. 끝 위치까지 포함합니다.\n"
+                             "시작 위치가 이름보다 길면 유지, 끝 위치만 넘으면 마지막 문자까지 적용합니다.")
         self.prefix = QLineEdit()
         self.suffix = QLineEdit()
         self.whitespace = QCheckBox("모든 공백 삭제")
@@ -253,6 +264,8 @@ class MainWindow(QMainWindow):
         form.addRow("적용 범위", self.scope)
         form.addRow("작업", self.operation)
         form.addRow("찾기 / 구분자", self.find_text)
+        form.addRow("시작 (1부터)", self.range_start)
+        form.addRow("끝 (포함)", self.range_end)
         form.addRow("바꿀 내용", self.replacement)
         form.addRow("앞에 붙이기", self.prefix)
         form.addRow("뒤에 붙이기", self.suffix)
@@ -264,6 +277,8 @@ class MainWindow(QMainWindow):
             combo.currentIndexChanged.connect(self.refresh_preview)
         for check in (self.whitespace, self.special):
             check.toggled.connect(self.refresh_preview)
+        for field in (self.range_start, self.range_end):
+            field.valueChanged.connect(self.refresh_preview)
         right_layout.addWidget(group)
         preview_group = QGroupBox("적용 전 미리보기")
         preview_layout = QVBoxLayout(preview_group)
@@ -391,7 +406,8 @@ class MainWindow(QMainWindow):
     def name_changes(self):
         rule = NameRule(self.operation.currentData(), self.find_text.text(),
                         self.replacement.text(), self.prefix.text(), self.suffix.text(),
-                        self.whitespace.isChecked(), self.special.isChecked())
+                        self.whitespace.isChecked(), self.special.isChecked(),
+                        start=self.range_start.value(), end=self.range_end.value())
         rows = self.selected_rows() if self.scope.currentIndex() == 1 else range(len(self.model.ports))
         ports = [replace(port) for port in self.model.ports]
         changed = []
@@ -406,8 +422,13 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "preview"):
             return
         operation = self.operation.currentData()
+        self.name_form.setRowVisible(self.find_text, operation != "range")
+        for field in (self.range_start, self.range_end):
+            self.name_form.setRowVisible(field, operation == "range")
         self.find_text.setEnabled(operation != "channel")
-        self.replacement.setEnabled(operation in ("replace", "regex"))
+        self.replacement.setEnabled(operation in ("replace", "regex", "range"))
+        self.replacement.setToolTip("정규식 그룹 사용: $1, $2 · 번호를 뒤로 이동: $2/$1 · 달러 기호: $$"
+                                    if operation == "regex" else "입력한 문자열로 바꿉니다. 비워 두면 삭제합니다.")
         self.selection_label.setText(f"{self.proxy.rowCount()} / {len(self.model.ports)}개 표시  ·  "
                                      f"{len(self.selected_rows())}개 선택" +
                                      ("  ·  수동 이동은 검색 해제 후 가능" if self.search.text() else ""))
@@ -452,6 +473,8 @@ class MainWindow(QMainWindow):
         self.whitespace.setChecked(False)
         self.special.setChecked(False)
         self.operation.setCurrentIndex(0)
+        self.range_start.setValue(1)
+        self.range_end.setValue(1)
         self.refresh_preview()
 
     def refresh(self, *args):

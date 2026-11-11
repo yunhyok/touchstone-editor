@@ -104,6 +104,40 @@ def test_filter_edit_updates_correct_source_port(window):
     assert not window.move_button.isEnabled()
 
 
+def test_character_range_preview_selected_apply_and_undo(window):
+    select(window, 0, 1)
+    window.scope.setCurrentIndex(1)
+    window.operation.setCurrentIndex(window.operation.findData("range"))
+    assert window.find_text.isHidden()
+    assert not window.range_start.isHidden()
+    window.range_end.setValue(2)
+    assert window.preview.item(0, 1).text() == "10"
+    window.replacement.setText("SIGNAL_")
+    assert window.preview.item(0, 1).text() == "SIGNAL_10"
+    assert window.preview.rowCount() == 2
+    window.apply_names()
+    assert [p.name for p in window.model.ports] == ["SIGNAL_10", "SIGNAL_2", "CH1"]
+    assert window.range_start.value() == window.range_end.value() == 1
+    assert window.range_start.isHidden()
+    assert not window.find_text.isHidden()
+    window.undo_stack.undo()
+    assert [p.name for p in window.model.ports] == ["CH10", "CH2", "CH1"]
+    window.undo_stack.redo()
+    assert [p.name for p in window.model.ports] == ["SIGNAL_10", "SIGNAL_2", "CH1"]
+
+
+def test_character_range_invalid_or_empty_result_blocks_apply(window):
+    window.operation.setCurrentIndex(window.operation.findData("range"))
+    window.range_start.setValue(3)
+    assert not window.apply_button.isEnabled()
+    assert window.preview.rowCount() == 0
+    window.range_end.setValue(3)
+    window.range_start.setValue(1)
+    assert not window.apply_button.isEnabled()
+    assert "비어" in window.preview_label.text()
+    assert [p.name for p in window.model.ports] == ["CH10", "CH2", "CH1"]
+
+
 def test_resize_round_trip_keeps_both_editors_visible(window, application):
     window.show()
     window.resize(683, 352)

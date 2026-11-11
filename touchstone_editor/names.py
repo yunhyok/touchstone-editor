@@ -66,6 +66,8 @@ class NameRule:
     suffix: str = ""
     whitespace: bool = False
     special: bool = False
+    start: int = 1
+    end: int = 1
 
     def apply(self, name: str) -> str:
         if self.operation == "channel":
@@ -74,6 +76,11 @@ class NameRule:
             name = name.replace(self.find, self.replacement)
         elif self.operation == "regex" and self.find:
             name = _regex_replace(self.find, self.replacement, name)
+        elif self.operation == "range":
+            if self.start < 1 or self.end < self.start:
+                raise ValueError("문자 위치는 1부터 시작하며, 끝 위치는 시작 위치 이상이어야 합니다.")
+            if self.start <= len(name):
+                name = name[:self.start - 1] + self.replacement + name[self.end:]
         elif self.operation == "delete" and self.find:
             name = name.translate(str.maketrans("", "", self.find))
         elif self.operation == "before" and self.find:
