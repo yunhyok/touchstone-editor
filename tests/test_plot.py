@@ -105,6 +105,23 @@ def test_zoom_keeps_the_anchor_and_rejects_degenerate_views(plot):
     assert plot.view == pytest.approx(before) and not plot.modified
 
 
+def test_a_single_high_frequency_point_can_still_be_zoomed_on_linear_axes(plot):
+    plot.set_scales(False, False)
+    plot.set_data([Trace("a", np.array([1e10]), np.array([0.5]), "#ffffff", markers=True)])
+    before = plot.view
+    assert before[0] < 1e10 < before[1]
+    centre = plot.plot_rect().center()
+    plot.zoom(0.5, QPointF(centre))
+    assert plot.view[1] - plot.view[0] == pytest.approx((before[1] - before[0]) / 2)
+    assert plot.view[3] - plot.view[2] == pytest.approx((before[3] - before[2]) / 2)
+
+
+def test_dashed_traces_paint_and_share_the_legend(plot):
+    x = np.logspace(1, 4, 20)
+    plot.set_data([Trace("a  · MA", x, x * 2, "#ffffff", dashed=True), Trace("a", x, x, "#ffffff")])
+    assert not plot.grab().isNull()
+
+
 def test_hover_finds_the_nearest_point_and_prefers_markers(plot, application):
     x = np.array([10.0, 100.0, 1000.0])
     line = Trace("line", x, np.array([1.0, 10.0, 100.0]), "#ffffff", note="보간")
