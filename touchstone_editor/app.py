@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 
 from . import __version__
 from .core import CancelledError, export_touchstone, read_touchstone
-from .interpolation import estimate_size, export_interpolated, format_frequency, load_network, s_to_z
+from .interpolation import (describe, estimate_size, export_interpolated, format_frequency, load_network,
+                            s_to_z)
 from .interpolation_tab import InterpolationTab, format_bytes
 from .names import NameRule, natural_key, validate_names
 from .theme import apply_theme
@@ -347,7 +348,12 @@ class MainWindow(QMainWindow):
             action = QAction(self)
             action.setShortcut(QKeySequence(key))
             action.triggered.connect(callback)
-            self.addAction(action)
+            if key.startswith("Alt"):
+                # Moving ports belongs to the port page; elsewhere Alt+Down opens a combo box.
+                action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+                self.content.addAction(action)
+            else:
+                self.addAction(action)
 
     def selected_rows(self):
         return sorted({self.proxy.mapToSource(index).row()
@@ -601,9 +607,13 @@ class MainWindow(QMainWindow):
         return Path(dialog.selectedFiles()[0])
 
     def save_interpolated(self):
-        if self.job or not self.document or not self.interpolation.can_export() or not self.valid_names():
+        if self.job or not self.document:
             return
-        source, targets, ri_ports = self.interpolation.export_request()
+        self.interpolation.prepare_export()
+        if not self.interpolation.can_export() or not self.valid_names():
+            return
+        bands, plan, ri_ports, axis = self.interpolation.export_request()
+        source, targets = self.interpolation.network.frequencies, plan.frequencies
         target = self.choose_target("_interp", "보간 결과 저장")
         if target is None:
             return
@@ -618,16 +628,19 @@ class MainWindow(QMainWindow):
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                 return
         ports = [replace(port) for port in self.model.ports]
+        notes = describe(self.document, ports, bands, plan, ri_ports, axis)
 
         def save(progress, cancel):
-            export_interpolated(self.document, ports, target, source, targets, ri_ports, progress, cancel)
+            export_interpolated(self.document, ports, target, source, targets, ri_ports, axis, notes,
+                                progress, cancel)
             return target
 
         def saved(result):
             self.undo_stack.setClean()
             self.statusBar().showMessage(f"저장 완료: {result}")
             QMessageBox.information(self, "저장 완료",
-                                    f"보간한 파일을 저장했습니다. 주파수 지점 {len(targets):,}개\n\n{result}")
+                                    f"보간한 파일을 저장했습니다. 주파수 지점 {len(targets):,}개 "
+                                    f"(추가 {int(plan.added.sum()):,}개)\n\n{result}")
 
         self.start_job(save, saved, "보간 결과 저장 중…")
 

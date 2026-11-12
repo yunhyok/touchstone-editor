@@ -1,14 +1,18 @@
-"""Resample S-parameters on banded frequency grids.
+"""Add interpolated frequency points to S-parameters.
 
-Selected ports use linear interpolation of the real and imaginary parts, which is what
-INTDATTYP=RI requests from an HSPICE-compatible S-element. The remaining entries use
-linear magnitude and shortest-arc angle interpolation.
+A tool that combines networks interpolates between the file's frequency points. Doing that
+on magnitude and angle bends every matrix entry along its own path and breaks the linear
+relations between entries, so a small series impedance carried by those relations turns
+into a false resonance. Interpolating the real and imaginary parts keeps the relations;
+INTDATTYP=RI selects it in an HSPICE-compatible S model. This module writes that
+interpolation into the file: every source point stays and bands of new points go between.
 """
 
 import math
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 import numpy as np
@@ -18,9 +22,17 @@ from .core import (_check_cancel, _check_source, _export_lines, _lines, _points,
                    export_touchstone, option_settings)
 
 LINEAR_COUNT, DECADE_COUNT, LINEAR_STEP = "linear_count", "decade_count", "linear_step"
+LOG_AXIS, LINEAR_AXIS = "log", "lin"
 MAX_POINTS = 1_000_000
+# Below this many points per decade a later magnitude/angle interpolation still leaves visible error.
+DENSITY_LIMIT = 40
+# Above this angle step between source points, real/imaginary interpolation loses magnitude.
+PHASE_LIMIT = 20.0
 _CHANGED = "The source file changed. Open it again before exporting."
-_TOLERANCE = 1e-12
+# A band point this close to a source frequency, relative, is that source frequency.
+_TOLERANCE = 1e-9
+# Smaller magnitudes carry no usable angle.
+_MEANINGFUL = 0.01
 _FREQUENCY = re.compile(r"\s*((?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)\s*(hz|khz|mhz|ghz|k|meg|m|g)?\s*",
                         re.IGNORECASE)
 _SCALES = {"": 1, "hz": 1, "k": 10**3, "khz": 10**3, "m": 10**6, "meg": 10**6, "mhz": 10**6,
@@ -42,8 +54,10 @@ DEFAULT_BANDS = (Band(0.0, 1e3, LINEAR_COUNT, 101),
 
 @dataclass(frozen=True)
 class Plan:
+    # Every source frequency plus the added ones, and which of them are added.
     frequencies: np.ndarray
-    # One (first, last, point count) per band, or None when the band misses the source range.
+    added: np.ndarray
+    # One (first, last, points, new points) per band, or None when the band misses the source range.
     ranges: tuple
 
 
@@ -54,6 +68,24 @@ class Network:
     matrices: list | None
     references: np.ndarray
     data_format: str
+    # Per source interval and port: the largest angle step in degrees, and the largest gap between
+    # magnitude/angle and real/imaginary interpolation halfway through the interval.
+    phase_steps: np.ndarray
+    differences: np.ndarray
+    # Largest |S - S transposed| over all source points.
+    asymmetry: float
+    # Largest singular value over all source points, once a check has measured it.
+    gain: float | None = None
+
+
+@dataclass(frozen=True)
+class Checks:
+    source_gain: float
+    added_gain: float
+    asymmetry: float
+    # Largest gap a second magnitude/angle interpolation of the output would open, and where.
+    remaining: float
+    remaining_range: tuple | None
 
 
 def parse_frequency(text):
@@ -61,17 +93,21 @@ def parse_frequency(text):
     match = _FREQUENCY.fullmatch(text)
     if match is None:
         raise ValueError(f"주파수를 해석할 수 없습니다: {text.strip() or '빈 값'}  (예: 0, 1k, 10MHz, 2G)")
-    value = float(Decimal(match[1]) * _SCALES[(match[2] or "").lower()])
+    try:
+        value = float(Decimal(match[1]) * _SCALES[(match[2] or "").lower()])
+    except (ArithmeticError, ValueError):
+        value = math.inf
     if not math.isfinite(value):
         raise ValueError("주파수가 너무 큽니다.")
     return value
 
 
-def format_frequency(hertz):
+def format_frequency(hertz, digits=12):
+    """Write a frequency with its unit; the default digits read back to the same value."""
     for scale, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
         if abs(hertz) >= scale:
-            return f"{hertz / scale:.12g} {unit}"
-    return f"{hertz:.12g} Hz"
+            return f"{hertz / scale:.{digits}g} {unit}"
+    return f"{hertz:.{digits}g} Hz"
 
 
 def _band_grid(band, low, high):
@@ -114,45 +150,79 @@ def _band_grid(band, low, high):
     return np.unique(np.concatenate(([start], np.clip(grid, start, stop), [stop])))
 
 
-def _merge(grid, source):
-    grid = np.unique(grid)
+def _snap(grid, source):
+    """Move grid points that match a source frequency onto it, so the source value is used."""
     if not len(grid):
         return grid
-    # Snap to source frequencies so those points keep their original values.
-    nearest = np.clip(np.searchsorted(source, grid), 1, len(source) - 1) if len(source) > 1 else None
-    if nearest is not None:
+    if len(source) > 1:
+        nearest = np.clip(np.searchsorted(source, grid), 1, len(source) - 1)
         below, above = source[nearest - 1], source[nearest]
         knots = np.where(grid - below <= above - grid, below, above)
     else:
         knots = np.full(len(grid), source[0])
-    grid = np.unique(np.where(np.abs(grid - knots) <= _TOLERANCE * np.abs(knots), knots, grid))
-    return grid[np.concatenate(([True], np.diff(grid) > _TOLERANCE * grid[1:]))]
+    return np.unique(np.where(np.abs(grid - knots) <= _TOLERANCE * np.abs(knots), knots, grid))
 
 
-def build_plan(bands, source, keep_source=False):
-    """Merge the band grids, clipped to the source range, into one output frequency list."""
+def build_plan(bands, source):
+    """Keep every source frequency and add the band points that fall inside the source range."""
     source = np.asarray(source, dtype=np.float64)
     if not len(source):
         raise ValueError("원본 주파수 지점이 없습니다.")
-    if not bands and not keep_source:
+    if not bands:
         raise ValueError("주파수 구간을 하나 이상 추가하세요.")
-    grids, ranges = [], []
+    positive = source[source > 0]
+    additions, ranges = [], []
     for number, band in enumerate(bands, 1):
         try:
-            grid = _merge(_band_grid(band, source[0], source[-1]), source)
+            grid = _snap(_band_grid(band, source[0], source[-1]), source)
         except ValueError as error:
             raise ValueError(f"구간 {number}: {error}") from error
-        grids.append(grid)
-        ranges.append((grid[0], grid[-1], len(grid)) if len(grid) else None)
-    if keep_source:
-        grids.append(source)
-    frequencies = _merge(np.concatenate(grids), source) if grids else np.empty(0)
-    if not len(frequencies):
+        # 0 Hz has no place on a log axis, so nothing is added below the first positive source point.
+        grid = grid[(grid == 0) | (grid >= positive[0])] if len(positive) else grid[grid == 0]
+        new = grid[~np.isin(grid, source)]
+        additions.append(new)
+        ranges.append((grid[0], grid[-1], len(grid), len(new)) if len(grid) else None)
+    if all(item is None for item in ranges):
         raise ValueError("모든 구간이 원본 주파수 범위 "
                          f"({format_frequency(source[0])} ~ {format_frequency(source[-1])}) 밖에 있습니다.")
+    added = np.unique(np.concatenate(additions))
+    if len(added):
+        added = added[np.concatenate(([True], np.diff(added) > _TOLERANCE * added[1:]))]
+    frequencies = np.union1d(source, added)
     if len(frequencies) > MAX_POINTS:
         raise ValueError(f"출력 지점 수가 {MAX_POINTS:,}개를 넘습니다. 간격이나 개수를 조정하세요.")
-    return Plan(frequencies, tuple(ranges))
+    return Plan(frequencies, ~np.isin(frequencies, source), tuple(ranges))
+
+
+def describe(document, ports, bands, plan, ri_ports, axis, now=None):
+    """Return the header comment lines that record how the output was made."""
+    now = now or datetime.now().astimezone()
+    name = "".join(character for character in document.source.name if character.isprintable())
+    added = int(plan.added.sum())
+    lines = [f"Resampled by Touchstone Editor {__version__} on {now.isoformat(sep=' ', timespec='seconds')}.",
+             f"Source file: {name}",
+             f"Frequency points: {len(plan.frequencies) - added} from the source, {added} added, "
+             f"{len(plan.frequencies)} in total."]
+    selected = [position for position, port in enumerate(ports, 1) if ri_ports[port.source_index - 1]]
+    where = "a log-frequency axis" if axis == LOG_AXIS else "a linear frequency axis"
+    if len(selected) == len(ports):
+        lines.append(f"Interpolation: real/imaginary (INTDATTYP=RI equivalent) on {where} for all ports.")
+    elif selected:
+        lines.append(f"Interpolation on {where}: real/imaginary (INTDATTYP=RI equivalent) for ports "
+                     f"{_port_ranges(selected)}; magnitude/angle for entries between the other ports.")
+    else:
+        lines.append(f"Interpolation: magnitude/angle on {where} for all ports.")
+    for number, (band, item) in enumerate(zip(bands, plan.ranges), 1):
+        if item is None:
+            continue
+        rule = {LINEAR_COUNT: f"{int(band.value)} points with linear spacing",
+                DECADE_COUNT: f"{int(band.value)} points per decade",
+                LINEAR_STEP: f"step {format_frequency(band.value)}"}[band.mode]
+        lines.append(f"Band {number}: {format_frequency(item[0])} to {format_frequency(item[1])}, {rule}, "
+                     f"{item[3]} new points.")
+    lines.append("Added points are interpolated values, not solver results. "
+                 "Source frequencies keep their original values.")
+    return lines
 
 
 def estimate_size(port_count, point_count):
@@ -191,9 +261,9 @@ class _Segment:
         if self.polar is not None:
             start, stop = start[self.polar], stop[self.polar]
             self.magnitudes = np.abs(start), np.abs(stop)
-            # A zero has no angle, so it takes the angle of the other end.
+            # A zero has no angle, so it takes the angle of the other end and the value does not turn.
             self.angle = np.where(start == 0, np.angle(stop), np.angle(start))
-            self.turn = np.angle(stop * np.conj(start))
+            self.turn = np.where((start == 0) | (stop == 0), 0.0, np.angle(stop * np.conj(start)))
 
     def at(self, fraction):
         result = self.start * (1 - fraction) + self.stop * fraction
@@ -204,12 +274,36 @@ class _Segment:
         return result
 
 
-def _fractions(source, targets):
-    """Return the source interval and the position inside it for every target."""
+def _position(target, start, stop, axis):
+    """Return how far a target lies between two source frequencies, from 0 to 1."""
+    target, start, stop = (np.asarray(value, dtype=np.float64) for value in (target, start, stop))
+    position = (target - start) / (stop - start)
+    if axis == LOG_AXIS:
+        # The interval that starts at 0 Hz has no logarithm and stays linear.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            position = np.where(start > 0, np.log(target / start) / np.log(stop / start), position)
+    return position
+
+
+def _positions(source, targets, axis):
+    """Return the source interval of every target and its position inside that interval."""
     if len(source) < 2:
         return np.zeros(len(targets), dtype=int), np.zeros(len(targets))
     index = np.clip(np.searchsorted(source, targets, side="right") - 1, 0, len(source) - 2)
-    return index, (targets - source[index]) / (source[index + 1] - source[index])
+    return index, _position(targets, source[index], source[index + 1], axis)
+
+
+def _polar_gap(start, stop):
+    """Distance between magnitude/angle and real/imaginary interpolation halfway between two values."""
+    polar = _Segment(start, stop, np.zeros(start.shape, dtype=bool)).at(0.5)
+    return np.abs(polar - (start + stop) / 2)
+
+
+def _interval_metrics(start, stop):
+    """Return the largest angle step in degrees and the largest interpolation gap of every port."""
+    turn = np.degrees(np.abs(np.angle(stop * np.conj(start))))
+    turn[(np.abs(start) < _MEANINGFUL) | (np.abs(stop) < _MEANINGFUL)] = 0
+    return [np.maximum(values.max(axis=0), values.max(axis=1)) for values in (turn, _polar_gap(start, stop))]
 
 
 def s_to_z(s, references, columns=None):
@@ -229,7 +323,7 @@ def _ri_mask(ri_ports):
     return None if ri_ports.all() else ri_ports[:, None] | ri_ports[None, :]
 
 
-def compute_traces(network, targets, entries, parameter, ri_ports, progress=None, cancel=None):
+def compute_traces(network, targets, entries, parameter, ri_ports, axis=LOG_AXIS, progress=None, cancel=None):
     """Evaluate matrix entries at the source and target frequencies.
 
     Entries are (row, column) pairs in source port order. Returns two complex arrays with
@@ -256,7 +350,7 @@ def compute_traces(network, targets, entries, parameter, ri_ports, progress=None
     original = np.array([pick(matrix) for matrix in matrices]).reshape(len(source), len(entries))
     if len(source) < 2:
         return original, np.repeat(original, len(targets), axis=0)
-    index, fractions = _fractions(source, targets)
+    index, fractions = _positions(source, targets, axis)
     mask = _ri_mask(ri_ports)
     if parameter == "S":
         mask = None if mask is None else mask[rows, columns]
@@ -308,8 +402,10 @@ def load_network(document, progress=None, cancel=None, memory_limit=None):
     if memory_limit is None:
         available = _available_memory()
         memory_limit = None if available is None else int(available * 0.6)
-    frequencies, matrices = [], []
+    frequencies, matrices, steps, differences = [], [], [], []
     names = [port.name for port in document.ports]
+    previous = None
+    asymmetry = 0.0
     with document.source.open("rb") as stream:
         _check_source(document.source, document._stamp, stream)
         raw_lines = _lines(stream, document, progress, cancel)
@@ -317,22 +413,87 @@ def load_network(document, progress=None, cancel=None, memory_limit=None):
                               [b"\n"], [True], True)
         for point in _points(lines, count, collect=True):
             frequencies.append(_frequency(point[0], settings.unit))
-            if matrices is None:
-                continue
-            if memory_limit is not None and 16 * count * count * (len(matrices) + 1) > memory_limit:
-                matrices = None
-                continue
-            try:
-                matrices.append(_matrix(point, count, settings.data_format))
-            except MemoryError:
-                matrices = None
+            matrix = _matrix(point, count, settings.data_format)
+            # The interval metrics need only two neighbouring points, so they survive a memory shortage.
+            if previous is not None:
+                step, difference = _interval_metrics(previous, matrix)
+                steps.append(step)
+                differences.append(difference)
+            asymmetry = max(asymmetry, float(np.abs(matrix - matrix.T).max()))
+            previous = matrix
+            if matrices is not None:
+                if memory_limit is not None and 16 * count * count * (len(matrices) + 1) > memory_limit:
+                    matrices = None
+                else:
+                    matrices.append(matrix)
         _check_source(document.source, document._stamp, stream)
     if not frequencies:
         raise ValueError("The file contains no S-parameter data.")
     document.point_count = len(frequencies)
     if progress is not None:
         progress(100)
-    return Network(np.array(frequencies), matrices, np.array(settings.references), settings.data_format)
+    shape = (len(frequencies) - 1, count)
+    return Network(np.array(frequencies), matrices, np.array(settings.references), settings.data_format,
+                   np.array(steps).reshape(shape), np.array(differences).reshape(shape), asymmetry)
+
+
+def _gain(matrix):
+    """Largest singular value; a passive network stays at or below one."""
+    return float(np.linalg.svd(matrix, compute_uv=False)[0])
+
+
+def touched_intervals(network, plan):
+    """Return the source intervals that receive at least one added point."""
+    added = plan.frequencies[plan.added]
+    return np.unique(np.searchsorted(network.frequencies, added, side="right") - 1)
+
+
+def check_plan(network, plan, ri_ports, axis=LOG_AXIS, progress=None, cancel=None):
+    """Measure the output: gain and symmetry of the added points, and the gap a second
+    magnitude/angle interpolation between neighbouring output points would still open."""
+    matrices, source = network.matrices, network.frequencies
+    if network.gain is None:
+        gain = 0.0
+        for matrix in matrices:
+            _check_cancel(cancel)
+            gain = max(gain, _gain(matrix))
+        network.gain = gain
+    mask = _ri_mask(ri_ports)
+    # Only entries interpolated on real and imaginary parts are at risk from a second interpolation.
+    entries = ... if mask is None else mask
+    index, positions = _positions(source, plan.frequencies, axis)
+    total = max(1, int(plan.added.sum()))
+    done = 0
+    added_gain = asymmetry = remaining = 0.0
+    remaining_range = None
+    previous = segment = None
+    current = -1
+    for frequency, new, interval, position in zip(plan.frequencies.tolist(), plan.added.tolist(),
+                                                  index.tolist(), positions.tolist()):
+        if new:
+            if interval != current:
+                current = interval
+                segment = _Segment(matrices[interval], matrices[interval + 1], mask)
+            matrix = segment.at(position)
+            added_gain = max(added_gain, _gain(matrix))
+            asymmetry = max(asymmetry, float(np.abs(matrix - matrix.T).max()))
+            done += 1
+            _check_cancel(cancel)
+            if progress is not None:
+                progress(min(99, 100 * done // total))
+        else:
+            matrix = matrices[int(np.searchsorted(source, frequency))]
+        if previous is not None and ri_ports.any():
+            start_frequency, start, start_new = previous
+            if new or start_new:
+                gap = float(_polar_gap(start[entries], matrix[entries]).max())
+            else:
+                # Between two untouched source points the load already measured the gap.
+                gap = float(network.differences[int(np.searchsorted(source, start_frequency))][ri_ports].max())
+            if gap > remaining:
+                remaining, remaining_range = gap, (start_frequency, frequency)
+        previous = frequency, matrix, new
+    return Checks(network.gain, added_gain, asymmetry, remaining, remaining_range)
 
 
 def _port_ranges(numbers):
@@ -348,32 +509,19 @@ def _port_ranges(numbers):
 class Resampler:
     """Write the target frequency points while the exporter streams the source points."""
 
-    def __init__(self, document, source, targets, ri_ports):
+    def __init__(self, document, source, targets, ri_ports, axis=LOG_AXIS, notes=()):
         self.count = document.port_count
         self.settings = option_settings(document.option_line, self.count)
         self.source = np.asarray(source, dtype=np.float64)
         self.targets = np.asarray(targets, dtype=np.float64)
-        self.ri_ports = np.asarray(ri_ports, dtype=bool)
-        self.mask = _ri_mask(self.ri_ports)
+        self.mask = _ri_mask(np.asarray(ri_ports, dtype=bool))
+        self.axis = axis
+        self.notes = notes
         self.seen = 0
         self.cursor = 0
         self.previous = None
         self.segment = None
         self.templates = {}
-
-    def _comment(self, order, newline):
-        selected = [position for position, index in enumerate(order, 1) if self.ri_ports[index]]
-        if len(selected) == self.count:
-            method = "real/imaginary linear (INTDATTYP=RI equivalent) for all ports"
-        elif selected:
-            method = ("real/imaginary linear (INTDATTYP=RI equivalent) for ports "
-                      f"{_port_ranges(selected)}; magnitude/angle linear for the other entries")
-        else:
-            method = "magnitude/angle linear for all ports"
-        lines = (f"! Resampled by Touchstone Editor {__version__}: "
-                 f"{len(self.source)} -> {len(self.targets)} frequency points.",
-                 f"! Interpolation: {method}.")
-        return b"".join(line.encode("ascii") + newline for line in lines)
 
     def _template(self, newline):
         template = self.templates.get(newline)
@@ -411,7 +559,8 @@ class Resampler:
         if self.seen >= len(self.source) or frequency != self.source[self.seen]:
             raise ValueError(_CHANGED)
         if not self.seen:
-            output.write(self._comment(order, newline))
+            for note in self.notes:
+                output.write(b"! " + note.encode("utf-8") + newline)
         self.seen += 1
         matrix = None
         while self.cursor < len(self.targets) and self.targets[self.cursor] <= frequency:
@@ -428,8 +577,8 @@ class Resampler:
                     matrix = _matrix(point, self.count, self.settings.data_format)
                     self.segment = start_frequency, _Segment(start, matrix, self.mask)
                 start_frequency, segment = self.segment
-                fraction = (target - start_frequency) / (frequency - start_frequency)
-                self._write(output, target, segment.at(fraction), order, newline)
+                position = float(_position(target, start_frequency, frequency, self.axis))
+                self._write(output, target, segment.at(position), order, newline)
             self.cursor += 1
             _check_cancel(cancel)
         self.previous = frequency, point, matrix
@@ -440,13 +589,15 @@ class Resampler:
             raise ValueError(_CHANGED)
 
 
-def export_interpolated(document, ports, target, source, targets, ri_ports, progress=None, cancel=None):
+def export_interpolated(document, ports, target, source, targets, ri_ports, axis=LOG_AXIS, notes=(),
+                        progress=None, cancel=None):
     """Write the resampled network with the current port names and order.
 
     `ri_ports` is a boolean per source port; True selects real/imaginary interpolation.
+    `notes` are comment lines written ahead of the data, such as those from describe().
     """
     ri_ports = np.asarray(ri_ports, dtype=bool)
     if len(ri_ports) != document.port_count:
         raise ValueError("The interpolation selection does not match the port count.")
     export_touchstone(document, ports, target, progress, cancel,
-                      Resampler(document, source, targets, ri_ports))
+                      Resampler(document, source, targets, ri_ports, axis, notes))

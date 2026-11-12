@@ -25,6 +25,7 @@ class Trace:
     color: str
     markers: bool = False
     note: str = ""
+    dashed: bool = False
 
 
 @dataclass
@@ -248,7 +249,8 @@ class PlotWidget(QWidget):
             if low > high:
                 low, high = 0.0, 1.0
             if high - low <= 1e-12 * max(1.0, abs(low), abs(high)):
-                pad = 0.5 if axis == 0 or self.y_log else max(abs(low) * 0.1, 0.5)
+                # A single value still needs a span the view limits accept.
+                pad = 0.5 if (self.x_log, self.y_log)[axis] else max(abs(low) * 0.1, 0.5)
             else:
                 pad = (high - low) * (0.02 if axis == 0 else 0.06)
             bounds += [low - pad, high + pad]
@@ -382,7 +384,7 @@ class PlotWidget(QWidget):
                 painter.setPen(pen)
                 painter.drawPoints(_polygon(px[inside], py[inside]))
                 continue
-            pen = QPen(color, 1.0)
+            pen = QPen(color, 1.0, Qt.DashLine if trace.dashed else Qt.SolidLine)
             pen.setCosmetic(True)
             painter.setPen(pen)
             for run_x, run_y in _clip_polyline(px, py, rect.left() - margin, rect.top() - margin,
@@ -442,7 +444,7 @@ class PlotWidget(QWidget):
     def _paint_legend(self, painter, rect, metrics):
         labels = {}
         for trace in self.traces:
-            labels.setdefault(trace.label, trace.color)
+            labels.setdefault(trace.label, (trace.color, trace.dashed))
         if not 1 <= len(labels) <= _LEGEND_LIMIT:
             return
         width = min(max(metrics.horizontalAdvance(label) for label in labels) + 42, rect.width() * 0.5)
@@ -465,9 +467,9 @@ class PlotWidget(QWidget):
         painter.setPen(QPen(QColor("#505761"), 1))
         painter.setBrush(QColor(32, 34, 38, 215))
         painter.drawRoundedRect(box, 4, 4)
-        for number, (label, color) in enumerate(labels.items()):
+        for number, (label, (color, dashed)) in enumerate(labels.items()):
             top = box.top() + 5 + number * metrics.height()
-            painter.setPen(QPen(QColor(color), 2.5))
+            painter.setPen(QPen(QColor(color), 2.0, Qt.DashLine if dashed else Qt.SolidLine))
             painter.drawLine(QPointF(box.left() + 8, top + metrics.height() / 2),
                              QPointF(box.left() + 24, top + metrics.height() / 2))
             painter.setPen(QColor("#eceef1"))
