@@ -76,6 +76,13 @@ licenses = Path('dist/TouchstoneEditor/licenses')
 shutil.copyfile(Path(sys.base_prefix) / 'LICENSE.txt', licenses / 'CPython.txt')
 pyinstaller_license = next(path for path in files('PyInstaller') if path.name == 'COPYING.txt')
 shutil.copyfile(pyinstaller_license.locate(), licenses / 'PyInstaller.txt')
+# The NumPy wheel ships its own license and those of the libraries it bundles.
+numpy_licenses = [path for path in files('numpy') if '.dist-info/licenses/' in path.as_posix()]
+assert any(path.name == 'LICENSE.txt' for path in numpy_licenses), 'NumPy license files not found'
+for path in numpy_licenses:
+    target = licenses / 'NumPy' / path.as_posix().split('.dist-info/licenses/', 1)[1]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path.locate(), target)
 '@ | python -
     if ($LASTEXITCODE -ne 0) {
         throw 'Unable to copy the runtime licenses.'

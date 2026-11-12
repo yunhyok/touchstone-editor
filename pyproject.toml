@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "touchstone-editor"
-version = "1.2.1"
+version = "1.3.0"
 description = "A Windows editor for Touchstone S-parameter files"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["PySide6==6.11.0"]
+dependencies = ["PySide6==6.11.0", "numpy==2.5.3"]
 
 [project.urls]
 Repository = "https://github.com/yunhyok/touchstone-editor"

@@ -57,4 +57,15 @@ def apply_theme(app):
         QPlainTextEdit { background: #15181d; padding: 5px; }
         QSplitter::handle { background: #343940; }
         QCheckBox { spacing: 7px; padding: 3px 0; }
+        QTabWidget::pane { background: #202226; border: none; border-top: 1px solid #505761; }
+        QTabBar::tab { background: #2b2e34; color: #b9c1cc; border: 1px solid #454b55;
+            border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px;
+            padding: 7px 18px; margin-right: 3px; }
+        QTabBar::tab:hover { background: #363b43; color: #eceef1; }
+        QTabBar::tab:selected { background: #202226; color: #ffffff; font-weight: bold;
+            border-color: #8fc1ff; border-top: 2px solid #8fc1ff; }
+        QTabBar::tab:disabled { color: #808894; }
+        QTableView QComboBox { background: transparent; border: none; border-radius: 0;
+            padding: 2px 6px; min-height: 0; }
+        QTableView QComboBox:focus { border: 1px solid #8fc1ff; }
     """)
