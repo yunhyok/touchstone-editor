@@ -216,6 +216,39 @@ def _option_references(code, port_count, line_number):
     return None
 
 
+@dataclass(frozen=True)
+class OptionSettings:
+    unit: float
+    data_format: str
+    references: tuple[float, ...]
+
+
+_UNITS = {"HZ": 1.0, "KHZ": 1e3, "MHZ": 1e6, "GHZ": 1e9}
+
+
+def option_settings(option_line, port_count):
+    """Return the frequency unit, number format and per-port reference resistances."""
+    # Touchstone 1.x defaults: # GHZ S MA R 50.
+    unit, data_format, references = 1e9, "MA", [50.0]
+    tokens = option_line.lstrip("#").split()
+    offset = 0
+    while offset < len(tokens):
+        token = tokens[offset].upper()
+        offset += 1
+        if token in _UNITS:
+            unit = _UNITS[token]
+        elif token in ("RI", "MA", "DB"):
+            data_format = token
+        elif token == "R":
+            start = offset
+            while offset < len(tokens) and _positive_number(tokens[offset].encode("ascii", "replace")):
+                offset += 1
+            references = [float(value) for value in tokens[start:offset]] or references
+    if len(references) != port_count:
+        references = references[:1] * port_count
+    return OptionSettings(unit, data_format, tuple(references))
+
+
 def _points(lines, port_count, collect=False):
     row_size = 4 if port_count == 2 else port_count
     point_size = port_count * port_count
@@ -328,7 +361,8 @@ def _write_point(output, point, order, newline):
     output.write(point[0] + b" " + (newline + b"\t").join(rows) + newline)
 
 
-def _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline, point_complete):
+def _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline, point_complete,
+                  resample=False):
     names_written = False
     in_data = False
     option_written = False
@@ -354,7 +388,7 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             previous_state = in_diff_channels
             in_diff_channels = _diff_channel_state(code, comment, in_diff_channels, line_number)
             if previous_state or in_diff_channels:
-                if not changed_order and not changed_names:
+                if not changed_order and not changed_names and not (resample and in_data):
                     output.write(raw)
                 continue
         if code.startswith(b"["):
@@ -364,7 +398,8 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             if option_written:
                 raise ValueError(f"Line {line_number}: multiple option lines are unsupported.")
             option_written = True
-        port_values = _PORT_VALUES.match(comment) if changed_order and comment else None
+        # Resampling replaces every data row, so per-frequency vendor comments are dropped instead.
+        port_values = _PORT_VALUES.match(comment) if changed_order and comment and not resample else None
         if port_values:
             payload = comment[port_values.end():].strip()
             values = payload.split()
@@ -391,12 +426,12 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             raw = raw.split(b"!", 1)[0].rstrip(b" \t") + line_ending
         if is_data:
             in_data = True
-            if not changed_order:
+            if not changed_order and not resample:
                 output.write(raw)
             point_complete[0] = False
             yield line_number, code
             continue
-        if changed_order and in_data:
+        if (changed_order or resample) and in_data:
             continue
         if changed_order and is_option:
             reference = _option_references(code, len(order), line_number)
@@ -411,8 +446,11 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
         raise ValueError("The PowerSI .DiffChannels block is missing its end marker.")
 
 
-def export_touchstone(document, ports, target, progress=None, cancel=None):
-    """Write Ansys-style names and reorder both axes using the selected source indices."""
+def export_touchstone(document, ports, target, progress=None, cancel=None, resampler=None):
+    """Write Ansys-style names and reorder both axes using the selected source indices.
+
+    A resampler receives every source point and writes the output rows itself.
+    """
     target = Path(target).absolute()
     source = document.source
     port_count = document.port_count
@@ -444,14 +482,19 @@ def export_touchstone(document, ports, target, progress=None, cancel=None):
             with tempfile.NamedTemporaryFile(mode="wb", dir=target.parent, suffix=".tmp", delete=False) as output:
                 temporary_path = Path(output.name)
                 raw_lines = _lines(stream, document, progress, cancel)
-                lines = _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline, point_complete)
-                for point in _points(lines, port_count, collect=changed_order):
-                    if changed_order:
+                lines = _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline,
+                                      point_complete, resampler is not None)
+                for point in _points(lines, port_count, collect=changed_order or resampler is not None):
+                    if resampler is not None:
+                        resampler.feed(output, point, order, newline[0], cancel)
+                    elif changed_order:
                         _write_point(output, point, order, newline[0])
                     point_count += 1
                     point_complete[0] = True
                 if not point_count:
                     raise ValueError("The file contains no S-parameter data.")
+                if resampler is not None:
+                    resampler.finish()
                 _check_source(source, document._stamp, stream)
                 output.flush()
                 os.fsync(output.fileno())

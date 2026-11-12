@@ -21,6 +21,16 @@ Corresponding source is available from Qt at no charge.
 - [PySide6 and Shiboken6 6.11.0 source archives](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.0-src/)
 - [Qt 6.11 third-party component notices](https://doc.qt.io/qt-6.11/licenses-used-in-qt.html)
 
+## NumPy
+
+Touchstone Editor uses NumPy 2.5.3 under the BSD 3-Clause License.
+Copyright 2005–2025 NumPy Developers. The Windows wheel also bundles OpenBLAS
+(BSD 3-Clause), the LAPACK routines inside it (BSD-3-Clause-Open-MPI) and the GCC
+runtime library (GPL 3 or later with the GCC Runtime Library Exception 3.1).
+`licenses/NumPy/LICENSE.txt` contains these notices and license texts, and the
+other files under `licenses/NumPy` cover the components vendored in NumPy.
+[NumPy 2.5.3 source](https://github.com/numpy/numpy/tree/v2.5.3)
+
 ## CPython
 
 The Windows build includes the CPython runtime. Its license and copyright

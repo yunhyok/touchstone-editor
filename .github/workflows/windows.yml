@@ -5,6 +5,12 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish the built installer as release v<version> (main only)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,7 +40,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A pushed version tag, or a manual run on main that asks for a release.
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main')
     needs: build
     runs-on: windows-2025
     permissions:
@@ -49,11 +58,23 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          $tag = $env:GITHUB_REF_NAME
-          $installer = "Touchstone-Editor-Setup-$tag-x64.exe"
+          $installer = (Get-Item 'Touchstone-Editor-Setup-v*-x64.exe').Name
+          if ($installer -notmatch '^Touchstone-Editor-Setup-(v\d+\.\d+\.\d+)-x64\.exe$') {
+            throw "Unexpected installer name: $installer"
+          }
+          $tag = $Matches[1]
+          # A manual run has no tag yet, so the release creates it at the built commit.
+          $origin = if ($env:GITHUB_REF_TYPE -eq 'tag') { '--verify-tag' } else { "--target=$env:GITHUB_SHA" }
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+            # An existing tag would keep its old commit, so the installer would not match it.
+            gh api "repos/$env:GH_REPO/git/ref/tags/$tag" --silent 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              throw "Tag $tag already exists. Raise the version in pyproject.toml first."
+            }
+          }
           $release = gh release view $tag --json assets
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag $installer --verify-tag --title "Touchstone Editor $tag" --generate-notes
+            gh release create $tag $installer $origin --title "Touchstone Editor $tag" --generate-notes
           } elseif ($installer -notin ($release | ConvertFrom-Json).assets.name) {
             gh release upload $tag $installer
           }

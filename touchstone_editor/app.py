@@ -1,10 +1,12 @@
-"""Desktop port editor; numeric data stays in the streaming core."""
+"""Desktop port editor and frequency interpolation; file handling stays in the streaming core."""
 
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
+import numpy as np
 from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
                            Qt, QThread, QTimer, Signal)
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QUndoCommand, QUndoStack
@@ -18,6 +20,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 
 from . import __version__
 from .core import CancelledError, export_touchstone, read_touchstone
+from .interpolation import (describe, estimate_size, export_interpolated, format_frequency, load_network,
+                            s_to_z)
+from .interpolation_tab import InterpolationTab, format_bytes
 from .names import NameRule, natural_key, validate_names
 from .theme import apply_theme
 
@@ -101,11 +106,15 @@ class FileJob(QThread):
             self.error.emit(str(error))
 
 
+LARGE_OUTPUT_BYTES = 1024 ** 3
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.document = None
         self.job = None
+        self.closing = False
         self.model = PortModel(self)
         self.proxy = QSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
@@ -116,11 +125,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Touchstone Editor {__version__}")
         self.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "assets" / "icon.ico")))
         self.setMinimumSize(600, 300)
+        self.setAcceptDrops(True)
         self.build_ui()
         available = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, available.width() - 24), min(820, available.height() - 32))
         self.model.edit_requested.connect(self.edit_name)
         self.model.modelReset.connect(self.refresh)
+        self.model.modelReset.connect(lambda: self.interpolation.set_ports(self.model.ports))
         self.undo_stack.cleanChanged.connect(self.update_title)
         self.refresh()
 
@@ -140,17 +151,17 @@ class MainWindow(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("Touchstone Editor")
         title.setObjectName("title")
-        self.subtitle = QLabel("PowerSI → Ansys  /  포트 순서와 채널명 편집")
+        self.subtitle = QLabel("PowerSI → Ansys  /  포트 이름·순서 편집 · 주파수 보간")
         self.subtitle.setObjectName("subtitle")
         titles.addWidget(title)
         titles.addWidget(self.subtitle)
         heading.addLayout(titles, 1)
         self.open_button = self.button("파일 열기", self.open_file)
-        self.save_button = self.button("Ansys용으로 저장…", self.save_file, True)
+        self.save_button = self.button("Ansys용으로 저장…", self.save_current, True)
         heading.addWidget(self.open_button)
         heading.addWidget(self.save_button)
         outer.addLayout(heading)
-        self.file_label = QLabel(".sNp 파일을 열어 시작하세요. 원본과 다른 파일로 저장합니다.")
+        self.file_label = QLabel(".sNp 파일을 열거나 창에 끌어다 놓으세요. 원본과 다른 파일로 저장합니다.")
         self.file_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         outer.addWidget(self.file_label)
@@ -313,7 +324,13 @@ class MainWindow(QMainWindow):
         self.content.addWidget(self.splitter)
         self.content.addWidget(self.tabs)
         self.compact = False
-        outer.addWidget(self.content, 1)
+        self.pages = QTabWidget()
+        self.content.setContentsMargins(0, 8, 0, 0)
+        self.pages.addTab(self.content, "포트 이름·순서")
+        self.interpolation = InterpolationTab(self)
+        self.pages.addTab(self.interpolation, "주파수 보간")
+        self.pages.currentChanged.connect(self.page_changed)
+        outer.addWidget(self.pages, 1)
         progress_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.hide()
@@ -324,13 +341,19 @@ class MainWindow(QMainWindow):
         outer.addLayout(progress_row)
         self.setCentralWidget(central)
         self.statusBar().showMessage("준비")
-        for key, callback in [("Ctrl+O", self.open_file), ("Ctrl+Shift+S", self.save_file),
+        for key, callback in [("Ctrl+O", self.open_file), ("Ctrl+S", self.save_current),
+                              ("Ctrl+Shift+S", self.save_current),
                               ("Alt+Up", lambda: self.move_selected(-1)),
                               ("Alt+Down", lambda: self.move_selected(1))]:
             action = QAction(self)
             action.setShortcut(QKeySequence(key))
             action.triggered.connect(callback)
-            self.addAction(action)
+            if key.startswith("Alt"):
+                # Moving ports belongs to the port page; elsewhere Alt+Down opens a combo box.
+                action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+                self.content.addAction(action)
+            else:
+                self.addAction(action)
 
     def selected_rows(self):
         return sorted({self.proxy.mapToSource(index).row()
@@ -479,8 +502,9 @@ class MainWindow(QMainWindow):
 
     def refresh(self, *args):
         ready = self.document is not None and self.job is None
-        self.save_button.setEnabled(ready)
+        self.update_save_button()
         self.content.setEnabled(ready)
+        self.interpolation.setEnabled(self.job is None)
         self.open_button.setEnabled(self.job is None)
         self.undo_button.setEnabled(ready and self.undo_stack.canUndo())
         self.redo_button.setEnabled(ready and self.undo_stack.canRedo())
@@ -493,7 +517,27 @@ class MainWindow(QMainWindow):
 
     def update_title(self, *args):
         suffix = " *" if not self.undo_stack.isClean() else ""
-        self.setWindowTitle(f"Touchstone Editor {__version__}{suffix}")
+        name = f"{self.document.source.name}{suffix} — " if self.document else ""
+        self.setWindowTitle(f"{name}Touchstone Editor {__version__}")
+
+    def update_save_button(self):
+        ready = self.document is not None and self.job is None
+        interpolating = self.pages.currentWidget() is self.interpolation
+        self.save_button.setText("보간 결과 저장…" if interpolating else "Ansys용으로 저장…")
+        self.save_button.setEnabled(ready and (not interpolating or self.interpolation.can_export()))
+        self.save_button.setToolTip("현재 포트 이름·순서와 보간 결과를 함께 저장합니다. (Ctrl+S)" if interpolating
+                                    else "현재 포트 이름·순서를 Ansys용 주석으로 저장합니다. (Ctrl+S)")
+
+    def page_changed(self, *args):
+        self.update_save_button()
+        if self.pages.currentWidget() is self.interpolation:
+            self.interpolation.activate()
+
+    def save_current(self):
+        if self.pages.currentWidget() is self.interpolation:
+            self.save_interpolated()
+        else:
+            self.save_file()
 
     def confirm_discard(self):
         if self.undo_stack.isClean():
@@ -514,6 +558,7 @@ class MainWindow(QMainWindow):
 
     def load_document(self, document):
         self.document = document
+        self.interpolation.set_document(document)
         self.search.clear()
         self.undo_stack.clear()
         self.model.set_ports(document.ports)
@@ -522,26 +567,89 @@ class MainWindow(QMainWindow):
         self.meta_label.setText(f"{document.port_count} ports  ·  헤더만 읽음  ·  "
                                f"{document.option_line.strip()}")
         self.statusBar().showMessage("포트 헤더 읽기 완료 · 수치 데이터는 저장할 때 검사합니다.")
+        self.update_title()
         self.refresh()
 
-    def save_file(self):
+    def read_network(self):
+        """Read the numeric data for the interpolation tab."""
         if self.job or not self.document:
             return
+        document = self.document
+
+        def loaded(network):
+            self.interpolation.set_network(network)
+            source = network.frequencies
+            self.meta_label.setText(f"{document.port_count} ports  ·  {len(source):,} points  ·  "
+                                    f"{format_frequency(source[0])} ~ {format_frequency(source[-1])}  ·  "
+                                    f"{document.option_line.strip()}")
+            self.statusBar().showMessage(f"수치 데이터 읽기 완료 · 주파수 지점 {len(source):,}개")
+
+        self.start_job(lambda progress, cancel: load_network(document, progress, cancel), loaded,
+                       "수치 데이터 읽는 중…")
+
+    def valid_names(self):
         try:
             validate_names([port.name for port in self.model.ports])
         except ValueError as error:
             self.show_error(str(error))
-            return
+            return False
+        return True
+
+    def choose_target(self, tag, title):
         suffix = f".s{self.document.port_count}p"
-        suggested = self.document.source.with_name(self.document.source.stem + "_ansys" + suffix)
-        dialog = QFileDialog(self, "Ansys용 Touchstone 저장", str(suggested.parent),
-                             f"Touchstone (*{suffix})")
+        suggested = self.document.source.with_name(self.document.source.stem + tag + suffix)
+        dialog = QFileDialog(self, title, str(suggested.parent), f"Touchstone (*{suffix})")
         dialog.setAcceptMode(QFileDialog.AcceptSave)
         dialog.setDefaultSuffix(suffix.lstrip("."))
         dialog.selectFile(suggested.name)
         if dialog.exec() != QFileDialog.Accepted:
+            return None
+        return Path(dialog.selectedFiles()[0])
+
+    def save_interpolated(self):
+        if self.job or not self.document:
             return
-        target = Path(dialog.selectedFiles()[0])
+        self.interpolation.prepare_export()
+        if not self.interpolation.can_export() or not self.valid_names():
+            return
+        bands, plan, ri_ports, axis = self.interpolation.export_request()
+        source, targets = self.interpolation.network.frequencies, plan.frequencies
+        target = self.choose_target("_interp", "보간 결과 저장")
+        if target is None:
+            return
+        size = estimate_size(self.document.port_count, len(targets))
+        if size >= LARGE_OUTPUT_BYTES:
+            text = f"예상 파일 크기는 약 {format_bytes(size)}입니다."
+            try:
+                text += f"\n저장 위치의 여유 공간은 {format_bytes(shutil.disk_usage(target.parent).free)}입니다."
+            except OSError:
+                pass
+            if QMessageBox.question(self, "큰 파일 저장", text + "\n\n계속할까요?",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+        ports = [replace(port) for port in self.model.ports]
+        notes = describe(self.document, ports, bands, plan, ri_ports, axis)
+
+        def save(progress, cancel):
+            export_interpolated(self.document, ports, target, source, targets, ri_ports, axis, notes,
+                                progress, cancel)
+            return target
+
+        def saved(result):
+            self.undo_stack.setClean()
+            self.statusBar().showMessage(f"저장 완료: {result}")
+            QMessageBox.information(self, "저장 완료",
+                                    f"보간한 파일을 저장했습니다. 주파수 지점 {len(targets):,}개 "
+                                    f"(추가 {int(plan.added.sum()):,}개)\n\n{result}")
+
+        self.start_job(save, saved, "보간 결과 저장 중…")
+
+    def save_file(self):
+        if self.job or not self.document or not self.valid_names():
+            return
+        target = self.choose_target("_ansys", "Ansys용 Touchstone 저장")
+        if target is None:
+            return
         ports = [replace(port) for port in self.model.ports]
 
         def save(progress, cancel):
@@ -582,6 +690,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
         self.cancel_button.hide()
         self.refresh()
+        self.interpolation.load_finished()
+        if self.closing:
+            self.closing = False
+            self.close()
+        elif self.pages.currentWidget() is self.interpolation:
+            self.interpolation.activate()
 
     def show_error(self, message):
         self.statusBar().showMessage("작업 실패 · 원본 파일은 변경되지 않았습니다.")
@@ -589,13 +703,27 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.job:
+            # Close again once the running job has stopped safely.
+            self.closing = True
             self.cancel_job()
             event.ignore()
             return
         if self.confirm_discard():
+            self.interpolation.shutdown()
             event.accept()
         else:
             event.ignore()
+
+    def dragEnterEvent(self, event):
+        urls = event.mimeData().urls()
+        if len(urls) == 1 and urls[0].isLocalFile() and self.job is None:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        path = event.mimeData().urls()[0].toLocalFile()
+        event.acceptProposedAction()
+        # Leave the drop handler before a dialog can open.
+        QTimer.singleShot(0, lambda: self.open_file(path))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -617,7 +745,7 @@ class MainWindow(QMainWindow):
                 self.port_panel.show()
                 self.edit_panel.show()
                 self.splitter.setSizes([self.width() - 400, 350])
-        short = self.height() < 550
+        short = self.height() < 680
         self.subtitle.setVisible(not short)
         self.file_label.setVisible(not short)
         self.meta_label.setVisible(not short)
@@ -632,6 +760,9 @@ def main():
     window = MainWindow()
     window.show()
     if sys.argv[1:] == ["--smoke-test"]:
+        # One conversion proves the bundled linear algebra library loads in the packaged app.
+        if abs(s_to_z(np.array([[0.5 + 0j]]), np.array([50.0]))[0, 0] - 150) > 1e-9:
+            sys.exit(1)
         QTimer.singleShot(0, app.quit)
     elif len(sys.argv) > 1:
         QTimer.singleShot(0, lambda: window.open_file(sys.argv[1]))

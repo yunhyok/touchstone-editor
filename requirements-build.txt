@@ -2,6 +2,7 @@
 altgraph==0.17.5
 colorama==0.4.6
 iniconfig==2.3.0
+numpy==2.5.3
 packaging==26.2
 pefile==2024.8.26
 Pillow==12.2.0
