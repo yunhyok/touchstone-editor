@@ -17,10 +17,11 @@ from touchstone_editor.interpolation import (DECADE_COUNT, LINEAR_AXIS, LINEAR_C
                                              load_network, s_to_z)
 from touchstone_editor.theme import apply_theme
 
+# Three ports coupled by less than 0.01, so each one chooses its interpolation on its own.
 SOURCE = ("! Port[1] = CH10\n! Port[2] = CH2\n! Port[3] = CH1\n# Hz S RI R 50\n"
-          "100 -0.9 0 0.01 0 0.02 0\n 0.01 0 -0.8 0 0.03 0\n 0.02 0 0.03 0 -0.7 0\n"
-          "1000 -0.8 0.1 0.02 0 0.03 0\n 0.02 0 -0.7 0.1 0.04 0\n 0.03 0 0.04 0 -0.6 0.1\n"
-          "3000 -0.5 0.3 0.04 0 0.05 0\n 0.04 0 -0.4 0.3 0.06 0\n 0.05 0 0.06 0 -0.3 0.3\n")
+          "100 -0.9 0 0.001 0 0.002 0\n 0.001 0 -0.8 0 0.003 0\n 0.002 0 0.003 0 -0.7 0\n"
+          "1000 -0.8 0.1 0.002 0 0.003 0\n 0.002 0 -0.7 0.1 0.004 0\n 0.003 0 0.004 0 -0.6 0.1\n"
+          "3000 -0.5 0.3 0.004 0 0.005 0\n 0.004 0 -0.4 0.3 0.006 0\n 0.005 0 0.006 0 -0.3 0.3\n")
 
 
 @pytest.fixture(scope="module")
@@ -364,6 +365,56 @@ def test_report_warns_about_sparse_bands_and_steep_phase(window, application, mo
     tab.check_button.click()
     tab.wait()
     assert tab.checks is not None and tab.check_button.isHidden() and "수동성: 최대 특이값" in report()
+
+
+def coupled_block_text():
+    """A DUT port with a shunt capacitor and a small series path to its LGA port, eight points per decade."""
+    lines = ["! Port[1] = VDD/0", "! Port[2] = LGA-VDD/0", "# Hz S RI R 1"]
+    for frequency in 10 ** (np.arange(24, 57) / 8):
+        omega = 2 * np.pi * frequency
+        y, z = 1j * omega * 1.5e-6, 4e-3 + 1j * omega * 80e-12
+        d = 2 + z + y + y * z
+        s11, s21, s22 = (z - y - y * z) / d, 2 / d, (z - y + y * z) / d
+        cells = " ".join(repr(float(part)) for value in (s11, s21, s21, s22) for part in (value.real, value.imag))
+        lines.append(f"{float(frequency)!r} {cells}")
+    return "\n".join(lines) + "\n"
+
+
+def test_coupled_ports_are_checked_together_and_magnitude_angle_output_is_confirmed(window, application, monkeypatch):
+    tab = window.interpolation
+    block = window.document.source.with_name("block.s2p")
+    block.write_text(coupled_block_text())
+    window.open_file(str(block))
+    settle(window, application)
+    assert tab.model.groups.tolist() == [0, 0] and tab.ri_ports().tolist() == [True, True]
+    assert "VDD/0" in tab.model.index(1, 0).data(Qt.ToolTipRole)
+    assert "MA) 보간" not in tab.report.text()
+    # Unchecking the DUT port takes its LGA port along: a pair on two interpolations would invent resistance.
+    tab.proxy.setData(tab.proxy.index(0, 0), Qt.Unchecked, Qt.CheckStateRole)
+    tab.wait()
+    assert tab.ri_ports().tolist() == [False, False]
+    assert [port.name for port in tab.polar_outputs()] == ["VDD/0", "LGA-VDD/0"]
+    assert "⚠ 출력 포트 2개가 크기·위상(MA) 보간" in tab.report.text() and "기준 임피던스 곱" in tab.report.text()
+    asked = []
+    answer = [app_module.QMessageBox.No]
+    monkeypatch.setattr(app_module.QMessageBox, "question",
+                        lambda parent, title, text, *args: asked.append(text) or answer[0])
+    target = block.with_name("block_interp.s2p")
+    monkeypatch.setattr(window, "choose_target", lambda tag, title: target)
+    window.save_current()
+    settle(window, application)
+    assert len(asked) == 1 and "INTDATTYP=RI를 지정해도 없어지지 않습니다" in asked[0] and not target.exists()
+    answer[0] = app_module.QMessageBox.Yes
+    window.save_current()
+    settle(window, application)
+    assert len(asked) == 2 and b"magnitude/angle on a log-frequency axis for all ports" in target.read_bytes()
+    # Checking the LGA port brings the DUT port back, and the save no longer asks.
+    tab.check([2], True)
+    tab.wait()
+    assert tab.ri_ports().tolist() == [True, True] and tab.polar_outputs() == []
+    window.save_current()
+    settle(window, application)
+    assert len(asked) == 2 and b"(INTDATTYP=RI equivalent) on a log-frequency axis for all ports" in target.read_bytes()
 
 
 def test_wheel_zoom_drag_pan_and_ctrl_d_reset(window, application):

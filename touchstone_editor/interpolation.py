@@ -74,6 +74,8 @@ class Network:
     differences: np.ndarray
     # Largest |S - S transposed| over all source points.
     asymmetry: float
+    # Largest magnitude of every entry over all source points.
+    coupling: np.ndarray
     # Largest singular value over all source points, once a check has measured it.
     gain: float | None = None
 
@@ -406,6 +408,7 @@ def load_network(document, progress=None, cancel=None, memory_limit=None):
     names = [port.name for port in document.ports]
     previous = None
     asymmetry = 0.0
+    coupling = np.zeros((count, count))
     with document.source.open("rb") as stream:
         _check_source(document.source, document._stamp, stream)
         raw_lines = _lines(stream, document, progress, cancel)
@@ -420,6 +423,7 @@ def load_network(document, progress=None, cancel=None, memory_limit=None):
                 steps.append(step)
                 differences.append(difference)
             asymmetry = max(asymmetry, float(np.abs(matrix - matrix.T).max()))
+            np.maximum(coupling, np.abs(matrix), out=coupling)
             previous = matrix
             if matrices is not None:
                 if memory_limit is not None and 16 * count * count * (len(matrices) + 1) > memory_limit:
@@ -434,7 +438,30 @@ def load_network(document, progress=None, cancel=None, memory_limit=None):
         progress(100)
     shape = (len(frequencies) - 1, count)
     return Network(np.array(frequencies), matrices, np.array(settings.references), settings.data_format,
-                   np.array(steps).reshape(shape), np.array(differences).reshape(shape), asymmetry)
+                   np.array(steps).reshape(shape), np.array(differences).reshape(shape), asymmetry, coupling)
+
+
+def coupled_groups(coupling, limit=_MEANINGFUL):
+    """Label the ports so that ports joined by an entry of at least `limit` share a label.
+
+    Entries of coupled ports carry a small series impedance in their differences, so one
+    interpolation must cover the whole group: mixing magnitude/angle into it invents resistance.
+    """
+    linked = (coupling >= limit) | (coupling.T >= limit)
+    labels = np.full(len(coupling), -1)
+    group = 0
+    for first in range(len(coupling)):
+        if labels[first] >= 0:
+            continue
+        labels[first] = group
+        pending = [first]
+        while pending:
+            port = pending.pop()
+            for other in np.flatnonzero(linked[port] & (labels < 0)).tolist():
+                labels[other] = group
+                pending.append(other)
+        group += 1
+    return labels
 
 
 def _gain(matrix):
