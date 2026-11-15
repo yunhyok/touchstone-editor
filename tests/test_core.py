@@ -58,31 +58,32 @@ class TouchstoneTests(unittest.TestCase):
         self.assertNotIn(b"NETSLIST", output)
         self.assertEqual(read_touchstone(target).ports[0].name, "변경/0")
 
-    def test_two_port_and_row_major_permutations(self):
-        for count, order in ((2, [2, 1]), (3, [2, 3, 1]), (4, [3, 1, 4, 2]), (5, [4, 5, 1, 3, 2])):
-            with self.subTest(count=count):
+    def test_matrix_and_references_follow_selected_port_order(self):
+        cases = ((2, [2, 1]), (3, [2, 3, 1]), (4, [3, 1, 4, 2]), (5, [4, 5, 1, 3, 2]),
+                 (2, [2]), (3, [3, 1]), (5, [5, 3, 2]), (6, [6, 4, 2, 1, 5]))
+        for count, order in cases:
+            with self.subTest(count=count, order=order):
                 original = matrix_bytes(count)
                 references = b" ".join(str(25 * index).encode() for index in range(1, count + 1))
                 path = self.source(count, b"! Port101_A_0::SAMPLE\n# KHZ DB S R " + references + b"\n" + original)
                 document = read_touchstone(path)
-                target = self.target(count)
+                output_count = len(order)
+                target = self.target(output_count)
                 export_touchstone(document, [document.ports[index - 1] for index in order], target)
                 result = read_touchstone(target)
                 self.assertEqual(result.option_line, "# KHZ DB S R " + " ".join(str(25 * index) for index in order))
                 self.assertEqual([port.name for port in result.ports], [f"Port {index}" for index in order])
                 self.assertNotIn(b"Port101_", target.read_bytes())
                 values = original.split()
-                flattened = target.read_bytes().splitlines()[count + 1:]
+                flattened = target.read_bytes().splitlines()[output_count + 1:]
                 new_values = b" ".join(flattened).split()
                 self.assertEqual(new_values[0], values[0])
                 for new_row, old_row in enumerate(order):
                     for new_column, old_column in enumerate(order):
-                        if count == 2:
-                            new_offset = new_column * count + new_row
-                            old_offset = (old_column - 1) * count + old_row - 1
-                        else:
-                            new_offset = new_row * count + new_column
-                            old_offset = (old_row - 1) * count + old_column - 1
+                        new_offset = (new_column * output_count + new_row if output_count == 2
+                                      else new_row * output_count + new_column)
+                        old_offset = ((old_column - 1) * count + old_row - 1 if count == 2
+                                      else (old_row - 1) * count + old_column - 1)
                         self.assertEqual(new_values[1 + 2 * new_offset:3 + 2 * new_offset],
                                          values[1 + 2 * old_offset:3 + 2 * old_offset])
 
@@ -175,38 +176,43 @@ class TouchstoneTests(unittest.TestCase):
             with self.subTest(contents=contents):
                 source = self.source(count, contents)
                 document = read_touchstone(source)
-                target = self.target(count)
-                target.write_bytes(b"existing output")
                 orders = [document.ports]
                 if count > 1:
-                    orders.append(list(reversed(document.ports)))
+                    orders.extend((list(reversed(document.ports)), document.ports[1:]))
                 for order in orders:
+                    target = self.target(len(order))
+                    target.write_bytes(b"existing output")
                     with self.assertRaisesRegex(ValueError, error):
                         export_touchstone(document, order, target)
                     self.assertEqual(target.read_bytes(), b"existing output")
                     self.assertIsNone(document.point_count)
                     self.assertEqual(list(self.directory.glob("*.tmp")), [])
 
-    def test_rejects_invalid_permutations_names_and_target_aliases(self):
+    def test_rejects_invalid_selection_names_and_target_aliases(self):
         source = self.source(2, b"#\n" + matrix_bytes(2))
         document = read_touchstone(source)
         first, second = document.ports
         target = self.target(2)
-        for order in ([first], [first, first], [first, replace(second, source_index=3)],
-                      [replace(first, source_index=True), second]):
-            with self.assertRaisesRegex(ValueError, "exactly once"):
-                export_touchstone(document, order, target)
+        with self.assertRaisesRegex(ValueError, "at least one source port"):
+            export_touchstone(document, [], target)
+        invalid_orders = [[first, first]] + [[replace(second, source_index=index)]
+                                            for index in (0, 3, True, "2", 2.0)]
+        for order in invalid_orders:
+            with self.assertRaisesRegex(ValueError, "distinct integer source port indices"):
+                export_touchstone(document, order, self.target(len(order)))
         for name in ("", "   ", "X!Y", "X\nY", "X\rY", "X\0Y"):
             with self.assertRaisesRegex(ValueError, "nonempty name"):
                 export_touchstone(document, [replace(first, name=name), second], target)
         with self.assertRaisesRegex(ValueError, "extension"):
             export_touchstone(document, document.ports, self.target(1))
+        with self.assertRaisesRegex(ValueError, r"\.s1p extension"):
+            export_touchstone(document, [second], target)
         with self.assertRaisesRegex(ValueError, "different from the source"):
             export_touchstone(document, document.ports, source)
-        os.link(source, target)
+        subset_alias = self.target(1)
+        os.link(source, subset_alias)
         with self.assertRaisesRegex(ValueError, "different from the source"):
-            export_touchstone(document, document.ports, target)
-        target.unlink()
+            export_touchstone(document, [second], subset_alias)
         try:
             target.symlink_to(source)
         except OSError:
@@ -264,21 +270,25 @@ class TouchstoneTests(unittest.TestCase):
         self.assertNotIn(b".DiffChannels", target.read_bytes())
         self.assertNotIn(b"PKG::", target.read_bytes())
         self.assertEqual([port.name for port in read_touchstone(target).ports], ["B", "A"])
+        subset_target = self.target(1)
+        export_touchstone(document, document.ports[1:], subset_target)
+        self.assertNotIn(b".DiffChannels", subset_target.read_bytes())
+        self.assertEqual([port.name for port in read_touchstone(subset_target).ports], ["B"])
 
     def test_cancellation_and_failed_replace_are_atomic(self):
         source = self.source(2, b"#\n" + matrix_bytes(2))
-        target = self.target(2)
+        target = self.target(1)
         target.write_bytes(b"existing output")
         document = read_touchstone(source)
         progress = []
         with self.assertRaises(CancelledError):
             read_touchstone(source, cancel=lambda: True)
         with self.assertRaises(CancelledError):
-            export_touchstone(document, document.ports, target, progress.append, lambda: 99 in progress)
+            export_touchstone(document, document.ports[1:], target, progress.append, lambda: 99 in progress)
         self.assertEqual(progress, [0, 99])
         with patch("touchstone_editor.core.os.replace", side_effect=PermissionError("locked")):
             with self.assertRaises(PermissionError):
-                export_touchstone(document, document.ports, target)
+                export_touchstone(document, document.ports[1:], target)
         self.assertEqual(target.read_bytes(), b"existing output")
         self.assertEqual(set(self.directory.iterdir()), {source, target})
 
@@ -293,8 +303,8 @@ class TouchstoneTests(unittest.TestCase):
         self.assertTrue(target.read_bytes().endswith(b"! Port Impedance 75 0 45 0\n! Gamma 2 0 1 0\n"))
 
     def test_hfss_vectors_follow_matrix_order_and_frequency(self):
-        for count, order in ((2, [1, 0]), (3, [2, 0, 1])):
-            with self.subTest(count=count):
+        for count, order in ((2, [1, 0]), (3, [2, 0, 1]), (3, [2, 0]), (2, [1])):
+            with self.subTest(count=count, order=order):
                 data = bytearray()
                 expected_blocks = []
                 original_points = []
@@ -315,14 +325,17 @@ class TouchstoneTests(unittest.TestCase):
                 target = self.target(count)
                 export_touchstone(document, document.ports, target)
                 self.assertTrue(target.read_bytes().endswith(data))
+                output_count = len(order)
+                target = self.target(output_count)
                 export_touchstone(document, [document.ports[i] for i in order], target)
-                lines = target.read_bytes().splitlines()[count + 1:]
+                lines = target.read_bytes().splitlines()[output_count + 1:]
                 for point_number in range(2):
-                    row_count = 1 if count == 2 else count
+                    row_count = 1 if output_count <= 2 else output_count
                     offset = point_number * (row_count + 2)
                     actual = b" ".join(lines[offset:offset + row_count]).split()
                     original = original_points[point_number]
-                    axes = [(r, c) for c in order for r in order] if count == 2 else [(r, c) for r in order for c in order]
+                    axes = ([(r, c) for c in order for r in order] if output_count == 2
+                            else [(r, c) for r in order for c in order])
                     expected = [original[0]]
                     for row, column in axes:
                         cell = column * count + row if count == 2 else row * count + column
@@ -348,10 +361,10 @@ class TouchstoneTests(unittest.TestCase):
         for body in cases:
             with self.subTest(body=body):
                 document = read_touchstone(self.source(3, b"#\n" + body))
-                target = self.target(3)
+                target = self.target(2)
                 target.write_bytes(b"existing output")
                 with self.assertRaisesRegex(ValueError, "HFSS"):
-                    export_touchstone(document, list(reversed(document.ports)), target)
+                    export_touchstone(document, [document.ports[2], document.ports[0]], target)
                 self.assertEqual(target.read_bytes(), b"existing output")
                 self.assertEqual(list(self.directory.glob("*.tmp")), [])
 

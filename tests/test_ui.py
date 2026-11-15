@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QItemSelectionModel
+from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import QApplication
 
 from touchstone_editor.app import MainWindow
@@ -138,12 +138,13 @@ def test_character_range_invalid_or_empty_result_blocks_apply(window):
     assert [p.name for p in window.model.ports] == ["CH10", "CH2", "CH1"]
 
 
-def test_resize_round_trip_keeps_both_editors_visible(window, application):
+@pytest.mark.parametrize("size", [(683, 352), (600, 352)])
+def test_resize_round_trip_keeps_both_editors_visible(window, application, size):
     window.show()
-    window.resize(683, 352)
+    window.resize(*size)
     application.processEvents()
-    assert window.width() == 683
-    assert window.height() == 352
+    assert (window.width(), window.height()) == size
+    assert window.table.viewport().height() >= 34
     assert window.tabs.count() == 2
     assert window.table.isVisible()
     window.resize(1200, 800)
@@ -153,12 +154,15 @@ def test_resize_round_trip_keeps_both_editors_visible(window, application):
     assert min(window.splitter.sizes()) > 0
 
 
-def test_extensionless_existing_target_still_prompts(window, application, monkeypatch):
+@pytest.mark.parametrize("count", [2, 3])
+def test_extensionless_existing_target_still_prompts(window, application, monkeypatch, count):
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QFileDialog, QMessageBox
     import touchstone_editor.app as app_module
 
-    existing = window.document.source.with_name("existing.s3p")
+    if count == 2:
+        window.include_ports([1], False)
+    existing = window.document.source.with_name(f"existing.s{count}p")
     existing.write_bytes(b"keep this output")
     dialogs, prompts, exports = [], [], []
 
@@ -191,3 +195,94 @@ def test_extensionless_existing_target_still_prompts(window, application, monkey
     assert prompts
     assert not exports
     assert existing.read_bytes() == b"keep this output"
+
+
+def test_output_checks_follow_filter_sort_rename_and_undo(window):
+    assert all(port.included for port in window.model.ports)
+    window.search.setText("CH2")
+    assert window.proxy.setData(window.proxy.index(0, 0), Qt.Unchecked, Qt.CheckStateRole)
+    assert [port.source_index for port in window.output_ports()] == [1, 3]
+    window.search.clear()
+    window.sort_ports(False)
+    window.edit_name(0, "RENAMED")
+    assert [port.source_index for port in window.output_ports()] == [3, 1]
+    assert [window.model.data(window.model.index(row, 0)) for row in range(3)] == [1, "—", 2]
+    window.undo_stack.undo()
+    window.undo_stack.undo()
+    assert [port.source_index for port in window.output_ports()] == [1, 3]
+    window.undo_stack.undo()
+    assert len(window.output_ports()) == 3
+    window.undo_stack.redo()
+    assert [port.source_index for port in window.output_ports()] == [1, 3]
+
+
+def test_output_selection_only_and_empty_selection_blocks_save(window, monkeypatch):
+    select(window, 2)
+    window.include_only_selected()
+    assert [port.source_index for port in window.output_ports()] == [3]
+    window.include_ports(range(3), False)
+    assert not window.save_button.isEnabled()
+    errors = []
+    monkeypatch.setattr(window, "show_error", errors.append)
+    monkeypatch.setattr(window, "choose_target", lambda *args: pytest.fail("Empty output opened save dialog"))
+    window.save_file()
+    assert errors and "하나 이상" in errors[0]
+    window.undo_stack.undo()
+    assert window.save_button.isEnabled()
+
+
+def test_output_check_can_toggle_repeatedly_with_space(window, application):
+    from PySide6.QtTest import QTest
+
+    window.show()
+    window.table.setFocus()
+    window.table.setCurrentIndex(window.proxy.index(1, 0))
+    QTest.keyClick(window.table, Qt.Key_Space)
+    application.processEvents()
+    assert not window.model.ports[1].included
+    QTest.keyClick(window.table, Qt.Key_Space)
+    application.processEvents()
+    assert window.model.ports[1].included
+
+
+def test_regular_save_uses_checked_ports_and_current_names(window, monkeypatch, tmp_path):
+    from touchstone_editor.interpolation import load_network
+    import touchstone_editor.app as app_module
+
+    select(window, 0, 2)
+    window.include_only_selected()
+    window.sort_ports(False)
+    window.edit_name(0, "RENAMED")
+    target = tmp_path / "subset.s2p"
+    monkeypatch.setattr(window, "choose_target", lambda *args: target)
+    monkeypatch.setattr(app_module.QMessageBox, "information", lambda *args: None)
+    monkeypatch.setattr(window, "start_job", lambda action, saved, message: saved(action(None, None)))
+    window.save_file()
+    result = read_touchstone(target)
+    assert [port.name for port in result.ports] == ["RENAMED", "CH10"]
+    assert load_network(result).matrices[0].real.tolist() == [[33, 31], [13, 11]]
+
+
+@pytest.mark.parametrize("edit", ["name", "order"])
+def test_subset_save_keeps_excluded_edits_unsaved(window, monkeypatch, tmp_path, edit):
+    import touchstone_editor.app as app_module
+
+    if edit == "name":
+        window.edit_name(1, "UNSAVED")
+    else:
+        select(window, 1)
+        window.move_selected(1)
+    window.include_ports([1, 2], False)
+    target = tmp_path / "subset.s1p"
+    monkeypatch.setattr(window, "choose_target", lambda *args: target)
+    monkeypatch.setattr(app_module.QMessageBox, "information", lambda *args: None)
+    monkeypatch.setattr(window, "start_job", lambda action, saved, message: saved(action(None, None)))
+    window.save_file()
+    assert not window.undo_stack.isClean()
+    assert "UNSAVED" not in target.read_text()
+    prompts = []
+    def decline(*args):
+        prompts.append(args)
+        return app_module.QMessageBox.No
+    monkeypatch.setattr(app_module.QMessageBox, "question", decline)
+    assert not window.confirm_discard() and prompts

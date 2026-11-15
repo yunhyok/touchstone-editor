@@ -50,7 +50,7 @@ class ChannelModel(QAbstractTableModel):
     checks_changed = Signal()
     headers = ["RI 보간", "포트", "채널명", "위상 변화"]
     tips = ["체크한 채널이 포함된 항은 실수·허수(RI) 보간, 나머지 채널끼리의 항은 크기·위상(MA) 보간",
-            "저장될 포트 번호", "저장될 채널명",
+            "포트 탭의 전체 목록 순서. 출력 체크한 포트만 저장 시 1부터 다시 번호를 붙입니다.", "저장될 채널명",
             "지점을 추가하는 구간에서 인접한 원본 지점 사이의 최대 위상 변화 (크기 0.01 이상인 항).\n"
             f"{PHASE_LIMIT:g}°를 넘으면 RI 보간이 지점 사이의 크기를 줄입니다."]
 
@@ -285,6 +285,10 @@ class InterpolationTab(QWidget):
     def build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 8, 0, 0)
+        self.output_label = QLabel()
+        self.output_label.setObjectName("hint")
+        self.output_label.setWordWrap(True)
+        outer.addWidget(self.output_label)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack)
 
@@ -649,6 +653,11 @@ class InterpolationTab(QWidget):
         """Follow renames and reordering from the port tab while keeping checks and selection."""
         selected = self.selected_sources()
         self.model.set_ports(ports)
+        count = sum(port.included for port in ports)
+        self.output_label.setText(
+            f"출력 체크 {count} / {len(ports)}개" + (f" → .s{count}p" if count else " · 저장할 포트 없음")
+            + " · 포트 탭의 ‘출력 포트’에서 변경\n"
+            + "그래프·검사는 전체 포트 기준입니다. 아래 RI 체크는 보간 방식만 지정합니다.")
         self.select_sources(selected)
         self.schedule()
 
@@ -809,8 +818,12 @@ class InterpolationTab(QWidget):
             return
         source, targets = network.frequencies, plan.frequencies
         added = int(plan.added.sum())
-        size = format_bytes(estimate_size(len(self.model.ports), len(targets)))
-        lines = [f"원본 {len(source):,}점 + 추가 {added:,}점 → 출력 <b>{len(targets):,}점</b> · 약 {size}"]
+        count = sum(port.included for port in self.model.ports)
+        if count:
+            size = format_bytes(estimate_size(count, len(targets)))
+            lines = [f"원본 {len(source):,}점 + 추가 {added:,}점 → 출력 <b>{len(targets):,}점</b> · 약 {size}"]
+        else:
+            lines = [f"원본 {len(source):,}점 + 추가 {added:,}점 · 출력할 포트를 체크하세요."]
 
         def note(text, warning=False):
             mark, color = ("⚠", f' style="color:{_WARNING}"') if warning else ("✔", "")

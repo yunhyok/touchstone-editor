@@ -410,7 +410,7 @@ def load_network(document, progress=None, cancel=None, memory_limit=None):
         _check_source(document.source, document._stamp, stream)
         raw_lines = _lines(stream, document, progress, cancel)
         lines = _export_lines(raw_lines, _Discard(), list(range(count)), names, False, False,
-                              [b"\n"], [True], True)
+                              [b"\n"], [True], count, True)
         for point in _points(lines, count, collect=True):
             frequencies.append(_frequency(point[0], settings.unit))
             matrix = _matrix(point, count, settings.data_format)
@@ -523,10 +523,10 @@ class Resampler:
         self.segment = None
         self.templates = {}
 
-    def _template(self, newline):
-        template = self.templates.get(newline)
+    def _template(self, count, newline):
+        key = count, newline
+        template = self.templates.get(key)
         if template is None:
-            count = self.count
             number = "%.15g"
             if count <= 2:
                 rows = [" ".join([number] * (2 * count * count))]
@@ -534,13 +534,14 @@ class Resampler:
                 widths = [min(8, 2 * count - start) for start in range(0, 2 * count, 8)]
                 rows = [" ".join([number] * width) for _ in range(count) for width in widths]
             separator = newline.decode("ascii") + "\t"
-            template = self.templates[newline] = "%s " + separator.join(rows) + newline.decode("ascii")
+            template = self.templates[key] = "%s " + separator.join(rows) + newline.decode("ascii")
         return template
 
     def _write(self, output, frequency, matrix, order, newline):
         if order != list(range(self.count)):
             matrix = matrix[np.ix_(order, order)]
-        pairs = np.empty((self.count, self.count, 2))
+        count = len(order)
+        pairs = np.empty((count, count, 2))
         data_format = self.settings.data_format
         if data_format == "RI":
             pairs[..., 0], pairs[..., 1] = matrix.real, matrix.imag
@@ -549,9 +550,9 @@ class Resampler:
             # Decibels cannot express an exact zero.
             pairs[..., 0] = magnitude if data_format == "MA" else 20 * np.log10(np.maximum(magnitude, 1e-300))
             pairs[..., 1] = np.degrees(np.angle(matrix))
-        if self.count == 2:
+        if count == 2:
             pairs = pairs.transpose(1, 0, 2)
-        text = self._template(newline) % ("%.15g" % (frequency / self.settings.unit), *pairs.ravel().tolist())
+        text = self._template(count, newline) % ("%.15g" % (frequency / self.settings.unit), *pairs.ravel().tolist())
         output.write(text.encode("ascii"))
 
     def feed(self, output, point, order, newline, cancel=None):
@@ -566,7 +567,7 @@ class Resampler:
         while self.cursor < len(self.targets) and self.targets[self.cursor] <= frequency:
             target = self.targets[self.cursor]
             if target == frequency:
-                _write_point(output, point, order, newline)
+                _write_point(output, point, order, newline, self.count)
             elif self.previous is None:
                 raise ValueError(_CHANGED)
             else:
@@ -591,7 +592,7 @@ class Resampler:
 
 def export_interpolated(document, ports, target, source, targets, ri_ports, axis=LOG_AXIS, notes=(),
                         progress=None, cancel=None):
-    """Write the resampled network with the current port names and order.
+    """Write the resampled network for the selected ports in output order.
 
     `ri_ports` is a boolean per source port; True selects real/imaginary interpolation.
     `notes` are comment lines written ahead of the data, such as those from describe().

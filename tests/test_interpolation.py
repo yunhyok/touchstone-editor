@@ -287,6 +287,9 @@ def test_header_notes_name_the_selected_ports_and_the_axis(tmp_path):
     assert "Band 1: 1 kHz to 10 kHz, 10 points per decade, 9 new points." in mixed
     assert "Band 3: 1 kHz to 10 kHz, 3 points with linear spacing, 1 new points." in mixed
     assert not any(line.startswith("Band 2") for line in mixed)
+    subset = describe(document, [document.ports[1], document.ports[2]], bands, plan, [True, False, True], LOG_AXIS)
+    assert ("Interpolation on a log-frequency axis: real/imaginary (INTDATTYP=RI equivalent) for ports 2; "
+            "magnitude/angle for entries between the other ports.") in subset
     none = describe(document, ports, bands, plan, [False] * 3, LINEAR_AXIS)
     assert "Interpolation: magnitude/angle on a linear frequency axis for all ports." in none
 
@@ -332,9 +335,12 @@ def test_zero_magnitude_end_keeps_the_other_angle(tmp_path, value):
 
 
 @pytest.mark.parametrize("data_format", ["RI", "MA", "DB"])
-def test_every_number_format_round_trips_through_interpolation(tmp_path, data_format):
-    truth = {1.0: np.array([[0.2 + 0.1j, 0.05j, -0.3], [0.01, -0.9 + 0.01j, 0.2 - 0.2j], [0.4j, 0.3, 0.6]]),
-             2.0: np.array([[0.1 - 0.3j, 0.02, 0.1j], [0.5, -0.8 - 0.02j, 0.1], [-0.2, 0.3j, 0.5 + 0.1j]])}
+@pytest.mark.parametrize("order", [(0, 1, 2, 3), (3, 2, 0), (3, 2), (3,)])
+def test_every_number_format_round_trips_through_interpolation(tmp_path, data_format, order):
+    truth = {1.0: np.array([[0.2 + 0.1j, 0.05j, -0.3, 0.2], [0.01, -0.9 + 0.01j, 0.2 - 0.2j, 0.1],
+                           [0.4j, 0.3, 0.6, 0.12345678901234567], [-0.1j, -0.1, 0.2j, 0.2]]),
+             2.0: np.array([[0.1 - 0.3j, 0.02, 0.1j, 0.3], [0.5, -0.8 - 0.02j, 0.1, -0.3],
+                           [-0.2, 0.3j, 0.5 + 0.1j, 0.05], [0.5, 0.3, -0.35j, 0.4j]])}
 
     def text(value):
         value = complex(value)
@@ -345,20 +351,32 @@ def test_every_number_format_round_trips_through_interpolation(tmp_path, data_fo
 
     rows = "".join(f"{frequency} " + "\n ".join(" ".join(text(value) for value in row) for row in matrix) + "\n"
                    for frequency, matrix in truth.items())
-    document = write(tmp_path / "source.s3p", f"# kHz S {data_format} R 50\n" + rows)
+    document = write(tmp_path / "source.s4p", f"# kHz S {data_format} R 20 30 40 50\n" + rows)
     network = load_network(document)
     assert network.frequencies.tolist() == [1e3, 2e3]
     assert np.allclose(network.matrices[0], truth[1.0], rtol=1e-14, atol=1e-16)
-    target = tmp_path / "result.s3p"
-    export_interpolated(document, document.ports, target, network.frequencies, np.array([1e3, 1.25e3, 2e3]),
-                        [True, True, True], LINEAR_AXIS)
-    result = load_network(read_touchstone(target))
-    # The option line, and with it the number format and unit, is unchanged.
-    assert read_touchstone(target).option_line == document.option_line
+    ports = [document.ports[index] for index in order]
+    target = tmp_path / f"result.s{len(ports)}p"
+    export_interpolated(document, ports, target, network.frequencies, np.array([1e3, 1.25e3, 2e3]),
+                        [True, True, True, False], LINEAR_AXIS)
+    output = read_touchstone(target)
+    result = load_network(output)
+    assert output.option_line.split()[:5] == document.option_line.split()[:5]
+    assert result.references.tolist() == [network.references[index] for index in order]
+    assert [(port.source_index, port.name) for port in output.ports] == list(enumerate((p.name for p in ports), 1))
     assert result.frequencies.tolist() == [1e3, 1.25e3, 2e3]
-    assert np.allclose(result.matrices[1], 0.75 * truth[1.0] + 0.25 * truth[2.0], rtol=1e-13, atol=1e-15)
-    assert np.array_equal(result.matrices[0], network.matrices[0])
-    assert np.array_equal(result.matrices[2], network.matrices[1])
+    selection = np.ix_(order, order)
+    middle = 0.75 * truth[1.0] + 0.25 * truth[2.0]
+    # The source's fourth diagonal alone uses magnitude/angle, even when it becomes output port 1.
+    middle[3, 3] = cmath.rect(0.75 * 0.2 + 0.25 * 0.4, math.pi / 8)
+    assert np.allclose(result.matrices[1], middle[selection], rtol=1e-13, atol=1e-15)
+    tokens = [token for line in target.read_text().splitlines() if not line.startswith(("!", "#"))
+              for token in line.split()]
+    width = 1 + 2 * len(order)**2
+    for offset, (frequency, matrix) in zip((0, 2 * width), truth.items()):
+        cells = matrix[selection]
+        cells = cells.T if len(order) == 2 else cells
+        assert tokens[offset:offset + width] == [str(frequency), *" ".join(map(text, cells.ravel())).split()]
 
 
 def test_two_port_order_and_reordered_export(tmp_path):

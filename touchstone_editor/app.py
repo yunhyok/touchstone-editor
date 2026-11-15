@@ -7,7 +7,7 @@ from pathlib import Path
 from threading import Event
 
 import numpy as np
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
+from PySide6.QtCore import (QAbstractTableModel, QItemSelectionModel, QModelIndex, QSortFilterProxyModel,
                            Qt, QThread, QTimer, Signal)
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
@@ -29,11 +29,13 @@ from .theme import apply_theme
 
 class PortModel(QAbstractTableModel):
     edit_requested = Signal(int, str)
-    headers = ["새 포트", "원본 포트", "원본 이름", "저장할 채널명 · 더블클릭 편집"]
+    include_requested = Signal(int, bool)
+    headers = ["출력 포트", "원본 포트", "원본 이름", "저장할 채널명 · 더블클릭 편집"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ports = []
+        self.output_numbers = {}
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.ports)
@@ -44,23 +46,36 @@ class PortModel(QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
             return self.headers[section]
+        if role == Qt.ToolTipRole and orientation == Qt.Horizontal and section == 0:
+            return "체크한 포트만 저장합니다. 숫자는 저장될 포트 번호입니다."
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
         port = self.ports[index.row()]
+        if index.column() == 0:
+            if role == Qt.CheckStateRole:
+                return Qt.Checked if port.included else Qt.Unchecked
+            if role == Qt.ToolTipRole:
+                return "출력에 포함" if port.included else "출력에서 제외"
         if role == Qt.ToolTipRole and index.column() == 3:
             return f"원본 포트 {port.source_index}: {port.original_name}\n저장 이름: {port.name}"
         if role in (Qt.DisplayRole, Qt.EditRole, Qt.ToolTipRole):
-            return [index.row() + 1, port.source_index, port.original_name, port.name][index.column()]
+            return [self.output_numbers.get(port.source_index, "—"), port.source_index,
+                    port.original_name, port.name][index.column()]
         if role == Qt.TextAlignmentRole and index.column() < 2:
             return Qt.AlignCenter
 
     def flags(self, index):
         flags = super().flags(index)
+        if index.column() == 0:
+            return flags | Qt.ItemIsUserCheckable
         return flags | Qt.ItemIsEditable if index.column() == 3 else flags
 
     def setData(self, index, value, role=Qt.EditRole):
+        if index.isValid() and index.column() == 0 and role == Qt.CheckStateRole:
+            self.include_requested.emit(index.row(), Qt.CheckState(value) == Qt.Checked)
+            return True
         if index.isValid() and index.column() == 3 and role == Qt.EditRole:
             self.edit_requested.emit(index.row(), str(value))
             return True
@@ -69,6 +84,8 @@ class PortModel(QAbstractTableModel):
     def set_ports(self, ports):
         self.beginResetModel()
         self.ports = [replace(port) for port in ports]
+        self.output_numbers = {port.source_index: number for number, port in
+                               enumerate((port for port in self.ports if port.included), 1)}
         self.endResetModel()
 
 
@@ -124,12 +141,13 @@ class MainWindow(QMainWindow):
         self.undo_stack.setUndoLimit(100)
         self.setWindowTitle(f"Touchstone Editor {__version__}")
         self.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "assets" / "icon.ico")))
-        self.setMinimumSize(600, 300)
+        self.setMinimumSize(600, 352)
         self.setAcceptDrops(True)
         self.build_ui()
         available = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1280, available.width() - 24), min(820, available.height() - 32))
         self.model.edit_requested.connect(self.edit_name)
+        self.model.include_requested.connect(lambda row, state: self.include_ports([row], state))
         self.model.modelReset.connect(self.refresh)
         self.model.modelReset.connect(lambda: self.interpolation.set_ports(self.model.ports))
         self.undo_stack.cleanChanged.connect(self.update_title)
@@ -210,6 +228,17 @@ class MainWindow(QMainWindow):
         for widget in (self.up_button, self.down_button, self.position, self.move_button):
             move_row.addWidget(widget)
         move_row.addStretch()
+        output_button = QPushButton("출력 선택")
+        output_menu = QMenu(output_button)
+        output_menu.addAction("전체 체크", lambda: self.include_ports(range(len(self.model.ports)), True))
+        output_menu.addAction("전체 해제", lambda: self.include_ports(range(len(self.model.ports)), False))
+        output_menu.addSeparator()
+        output_menu.addAction("선택 행만 체크", self.include_only_selected)
+        output_menu.addAction("선택 행 체크", lambda: self.include_ports(self.selected_rows(), True))
+        output_menu.addAction("선택 행 해제", lambda: self.include_ports(self.selected_rows(), False))
+        output_button.setMenu(output_menu)
+        output_button.setToolTip("체크한 포트만 일반 저장·보간 저장에 포함합니다. 검색은 체크 상태를 바꾸지 않습니다.")
+        move_row.addWidget(output_button)
         left_layout.addLayout(move_row)
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -221,7 +250,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(34)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        self.table.setColumnWidth(0, 70)
+        self.table.setColumnWidth(0, 105)
         self.table.setColumnWidth(1, 80)
         self.table.setColumnWidth(2, 260)
         self.table.setColumnWidth(3, 320)
@@ -230,6 +259,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.table, 1)
         self.selection_label = QLabel()
         self.selection_label.setObjectName("hint")
+        self.selection_label.setWordWrap(True)
         left_layout.addWidget(self.selection_label)
 
         self.edit_panel = QScrollArea()
@@ -360,7 +390,7 @@ class MainWindow(QMainWindow):
                        for index in self.table.selectionModel().selectedRows()})
 
     def restore_selection(self, source_indices):
-        from PySide6.QtCore import QItemSelection, QItemSelectionModel
+        from PySide6.QtCore import QItemSelection
         selection = self.table.selectionModel()
         batch = QItemSelection()
         for row, port in enumerate(self.model.ports):
@@ -377,8 +407,16 @@ class MainWindow(QMainWindow):
         if self.job or ports == self.model.ports:
             return
         selected = {self.model.ports[row].source_index for row in self.selected_rows()}
+        current = self.proxy.mapToSource(self.table.currentIndex())
+        focused = self.model.ports[current.row()].source_index if current.isValid() else None
+        column = current.column()
         self.undo_stack.push(SnapshotCommand(self.model, ports, title))
         self.restore_selection(selected)
+        for row, port in enumerate(self.model.ports):
+            if port.source_index == focused:
+                index = self.proxy.mapFromSource(self.model.index(row, column))
+                self.table.selectionModel().setCurrentIndex(index, QItemSelectionModel.NoUpdate)
+                break
 
     def edit_name(self, row, name):
         name = name.strip()
@@ -390,6 +428,21 @@ class MainWindow(QMainWindow):
         ports = [replace(port) for port in self.model.ports]
         ports[row].name = name
         self.commit(ports, "채널명 편집")
+
+    def include_ports(self, rows, state):
+        ports = [replace(port) for port in self.model.ports]
+        for row in rows:
+            ports[row].included = state
+        self.commit(ports, "출력 포트 선택")
+
+    def include_only_selected(self):
+        rows = set(self.selected_rows())
+        if rows:
+            self.commit([replace(port, included=row in rows) for row, port in enumerate(self.model.ports)],
+                        "선택 행만 출력")
+
+    def output_ports(self):
+        return [replace(port) for port in self.model.ports if port.included]
 
     def sort_ports(self, reverse):
         self.commit(sorted(self.model.ports, key=lambda port: natural_key(port.name),
@@ -454,6 +507,7 @@ class MainWindow(QMainWindow):
                                     if operation == "regex" else "입력한 문자열로 바꿉니다. 비워 두면 삭제합니다.")
         self.selection_label.setText(f"{self.proxy.rowCount()} / {len(self.model.ports)}개 표시  ·  "
                                      f"{len(self.selected_rows())}개 선택" +
+                                     f"  ·  출력 체크 {len(self.model.output_numbers)}개" +
                                      ("  ·  수동 이동은 검색 해제 후 가능" if self.search.text() else ""))
         try:
             ports, changed = self.name_changes()
@@ -521,12 +575,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{name}Touchstone Editor {__version__}")
 
     def update_save_button(self):
-        ready = self.document is not None and self.job is None
+        ready = self.document is not None and self.job is None and bool(self.model.output_numbers)
         interpolating = self.pages.currentWidget() is self.interpolation
         self.save_button.setText("보간 결과 저장…" if interpolating else "Ansys용으로 저장…")
         self.save_button.setEnabled(ready and (not interpolating or self.interpolation.can_export()))
-        self.save_button.setToolTip("현재 포트 이름·순서와 보간 결과를 함께 저장합니다. (Ctrl+S)" if interpolating
-                                    else "현재 포트 이름·순서를 Ansys용 주석으로 저장합니다. (Ctrl+S)")
+        count = len(self.model.output_numbers)
+        self.save_button.setToolTip(f"출력 체크한 {count}개 포트를 .s{count}p로 저장합니다. (Ctrl+S)" if count
+                                    else "포트 탭에서 출력할 포트를 하나 이상 체크하세요.")
 
     def page_changed(self, *args):
         self.update_save_button()
@@ -588,15 +643,19 @@ class MainWindow(QMainWindow):
                        "수치 데이터 읽는 중…")
 
     def valid_names(self):
+        ports = self.output_ports()
+        if not ports:
+            self.show_error("출력할 포트를 하나 이상 체크하세요.")
+            return False
         try:
-            validate_names([port.name for port in self.model.ports])
+            validate_names([port.name for port in ports])
         except ValueError as error:
             self.show_error(str(error))
             return False
         return True
 
     def choose_target(self, tag, title):
-        suffix = f".s{self.document.port_count}p"
+        suffix = f".s{len(self.model.output_numbers)}p"
         suggested = self.document.source.with_name(self.document.source.stem + tag + suffix)
         dialog = QFileDialog(self, title, str(suggested.parent), f"Touchstone (*{suffix})")
         dialog.setAcceptMode(QFileDialog.AcceptSave)
@@ -605,6 +664,13 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QFileDialog.Accepted:
             return None
         return Path(dialog.selectedFiles()[0])
+
+    def mark_export_saved(self):
+        # Excluded name/order edits have not reached any output file.
+        if all(port.included or (port.source_index == position
+                                and port.name == self.document.ports[port.source_index - 1].name)
+               for position, port in enumerate(self.model.ports, 1)):
+            self.undo_stack.setClean()
 
     def save_interpolated(self):
         if self.job or not self.document:
@@ -617,7 +683,8 @@ class MainWindow(QMainWindow):
         target = self.choose_target("_interp", "보간 결과 저장")
         if target is None:
             return
-        size = estimate_size(self.document.port_count, len(targets))
+        ports = self.output_ports()
+        size = estimate_size(len(ports), len(targets))
         if size >= LARGE_OUTPUT_BYTES:
             text = f"예상 파일 크기는 약 {format_bytes(size)}입니다."
             try:
@@ -627,7 +694,6 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, "큰 파일 저장", text + "\n\n계속할까요?",
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                 return
-        ports = [replace(port) for port in self.model.ports]
         notes = describe(self.document, ports, bands, plan, ri_ports, axis)
 
         def save(progress, cancel):
@@ -636,7 +702,7 @@ class MainWindow(QMainWindow):
             return target
 
         def saved(result):
-            self.undo_stack.setClean()
+            self.mark_export_saved()
             self.statusBar().showMessage(f"저장 완료: {result}")
             QMessageBox.information(self, "저장 완료",
                                     f"보간한 파일을 저장했습니다. 주파수 지점 {len(targets):,}개 "
@@ -650,14 +716,14 @@ class MainWindow(QMainWindow):
         target = self.choose_target("_ansys", "Ansys용 Touchstone 저장")
         if target is None:
             return
-        ports = [replace(port) for port in self.model.ports]
+        ports = self.output_ports()
 
         def save(progress, cancel):
             export_touchstone(self.document, ports, target, progress, cancel)
             return target
 
         def saved(result):
-            self.undo_stack.setClean()
+            self.mark_export_saved()
             self.statusBar().showMessage(f"저장 완료: {result}")
             QMessageBox.information(self, "저장 완료", f"Ansys용 파일을 저장했습니다.\n\n{result}")
 

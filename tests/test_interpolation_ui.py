@@ -90,6 +90,43 @@ def test_tab_loads_data_and_clips_default_bands_to_the_source(window):
     assert window.save_button.text() == "Ansys용으로 저장…"
 
 
+def test_interpolated_save_uses_output_checks_independently_of_ri_checks(window, application, monkeypatch, tmp_path):
+    tab = window.interpolation
+    linear_bands(tab)
+    window.include_ports([1], False)
+    window.sort_ports(False)
+    window.edit_name(0, "RENAMED")
+    tab.model.set_checked([1, 2, 3], False)
+    tab.model.set_checked([3], True)
+    settle(window, application)
+    assert "출력 체크 2 / 3개 → .s2p" in tab.output_label.text()
+    assert "전체 포트 기준" in tab.output_label.text()
+    assert tab.ri_ports().tolist() == [False, False, True]
+    target = tmp_path / "subset_interp.s2p"
+    monkeypatch.setattr(window, "choose_target", lambda *args: target)
+    window.save_current()
+    settle(window, application)
+    result = read_touchstone(target)
+    assert [port.name for port in result.ports] == ["RENAMED", "CH10"]
+    saved = load_network(result)
+    assert saved.frequencies.tolist() == [100, 600, 1000, 1100, 1600, 2100, 2600, 3000]
+    original = tab.network.matrices
+    order = [2, 0]
+    assert np.array_equal(saved.matrices[0], original[0][np.ix_(order, order)])
+    assert np.allclose(saved.matrices[1][0], ((4 * original[0] + 5 * original[1]) / 9)[2, order])
+    assert tab.model.checked == {3}
+    window.include_ports(range(3), False)
+    settle(window, application)
+    assert not window.save_button.isEnabled()
+    assert "출력할 포트를 체크" in tab.report.text()
+    assert " · 약 " not in tab.report.text()
+    errors = []
+    monkeypatch.setattr(window, "show_error", errors.append)
+    monkeypatch.setattr(window, "choose_target", lambda *args: pytest.fail("Empty output opened save dialog"))
+    window.save_current()
+    assert errors and "하나 이상" in errors[0]
+
+
 def test_invalid_band_reports_its_row_and_blocks_saving(window):
     tab = window.interpolation
     tab.bands.item(0, 1).setText("abc")

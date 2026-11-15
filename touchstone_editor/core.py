@@ -20,6 +20,7 @@ class Port:
     source_index: int
     name: str
     original_name: str
+    included: bool = True
 
 
 @dataclass
@@ -345,24 +346,24 @@ def _check_target(target, source):
         raise ValueError("Choose an output file different from the source file.")
 
 
-def _write_point(output, point, order, newline):
-    port_count = len(order)
-    if port_count <= 2:
-        # Touchstone 1.x stores two-port values as 11, 21, 12, 22.
-        offsets = [1 + 2 * (column * port_count + row) for column in order for row in order]
+def _write_point(output, point, order, newline, source_count):
+    if len(order) <= 2:
+        # Only two-port files store the matrix column first.
+        row_stride, column_stride = (1, 2) if source_count == 2 else (source_count, 1)
+        offsets = [1 + 2 * (row * row_stride + column * column_stride) for column in order for row in order]
         values = [value for offset in offsets for value in point[offset:offset + 2]]
         output.write(b" ".join([point[0], *values]) + newline)
         return
     rows = []
     for row in order:
-        offset = 1 + 2 * row * port_count
+        offset = 1 + 2 * row * source_count
         values = [value for column in order for value in point[offset + 2 * column:offset + 2 * column + 2]]
         rows.extend(b" ".join(values[i:i + 8]) for i in range(0, len(values), 8))
     output.write(point[0] + b" " + (newline + b"\t").join(rows) + newline)
 
 
 def _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline, point_complete,
-                  resample=False):
+                  source_count, resample=False):
     names_written = False
     in_data = False
     option_written = False
@@ -404,9 +405,9 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
             payload = comment[port_values.end():].strip()
             values = payload.split()
             if (code or not in_data or not point_complete[0]
-                    or len(values) != 2 * len(order) or not _NUMERIC_LINE.fullmatch(payload)):
+                    or len(values) != 2 * source_count or not _NUMERIC_LINE.fullmatch(payload)):
                 raise ValueError(f"Line {line_number}: HFSS Gamma/Port Impedance requires one standalone line "
-                                 f"with {2 * len(order)} numeric values after a complete frequency point.")
+                                 f"with {2 * source_count} numeric values after a complete frequency point.")
             reordered = [value for index in order for value in values[2 * index:2 * index + 2]]
             output.write(comment[:port_values.end()] + b" " + b" ".join(reordered) + line_ending)
             after_port_values = True
@@ -434,7 +435,7 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
         if (changed_order or resample) and in_data:
             continue
         if changed_order and is_option:
-            reference = _option_references(code, len(order), line_number)
+            reference = _option_references(code, source_count, line_number)
             if reference is not None:
                 start, tokens = reference
                 raw = b"# " + b" ".join(tokens[:start] + [tokens[start + index] for index in order])
@@ -447,20 +448,23 @@ def _export_lines(raw_lines, output, order, names, changed_order, changed_names,
 
 
 def export_touchstone(document, ports, target, progress=None, cancel=None, resampler=None):
-    """Write Ansys-style names and reorder both axes using the selected source indices.
+    """Write Ansys-style names and select both axes in the given source port order.
 
     A resampler receives every source point and writes the output rows itself.
     """
     target = Path(target).absolute()
     source = document.source
     port_count = document.port_count
-    if _port_count(target) != port_count:
-        raise ValueError(f"The output file must have the .s{port_count}p extension.")
-    _check_target(target, source)
     indices = [port.source_index for port in ports]
-    if (any(type(index) is not int for index in indices)
-            or sorted(indices) != list(range(1, port_count + 1))):
-        raise ValueError("The output must include each source port exactly once.")
+    output_count = len(indices)
+    if not output_count:
+        raise ValueError("Select at least one source port to export.")
+    if (any(type(index) is not int or not 1 <= index <= port_count for index in indices)
+            or len(set(indices)) != output_count):
+        raise ValueError(f"The output must use distinct integer source port indices from 1 to {port_count}.")
+    if _port_count(target) != output_count:
+        raise ValueError(f"The output file must have the .s{output_count}p extension.")
+    _check_target(target, source)
     names = []
     for port in ports:
         name = port.name.strip()
@@ -483,12 +487,12 @@ def export_touchstone(document, ports, target, progress=None, cancel=None, resam
                 temporary_path = Path(output.name)
                 raw_lines = _lines(stream, document, progress, cancel)
                 lines = _export_lines(raw_lines, output, order, names, changed_order, changed_names, newline,
-                                      point_complete, resampler is not None)
+                                      point_complete, port_count, resampler is not None)
                 for point in _points(lines, port_count, collect=changed_order or resampler is not None):
                     if resampler is not None:
                         resampler.feed(output, point, order, newline[0], cancel)
                     elif changed_order:
-                        _write_point(output, point, order, newline[0])
+                        _write_point(output, point, order, newline[0], port_count)
                     point_count += 1
                     point_complete[0] = True
                 if not point_count:
