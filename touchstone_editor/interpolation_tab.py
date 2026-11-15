@@ -15,8 +15,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QGroupBo
 
 from .core import CancelledError
 from .interpolation import (DECADE_COUNT, DEFAULT_BANDS, DENSITY_LIMIT, LINEAR_AXIS, LINEAR_COUNT, LINEAR_STEP,
-                            LOG_AXIS, PHASE_LIMIT, Band, build_plan, check_plan, compute_traces, estimate_size,
-                            format_frequency, parse_frequency, touched_intervals)
+                            LOG_AXIS, PHASE_LIMIT, Band, build_plan, check_plan, compute_traces, coupled_groups,
+                            estimate_size, format_frequency, parse_frequency, touched_intervals)
 from .names import natural_key
 from .plot import COLORS, PlotWidget, Region, Trace, engineering
 
@@ -49,7 +49,9 @@ class ChannelModel(QAbstractTableModel):
 
     checks_changed = Signal()
     headers = ["RI 보간", "포트", "채널명", "위상 변화"]
-    tips = ["체크한 채널이 포함된 항은 실수·허수(RI) 보간, 나머지 채널끼리의 항은 크기·위상(MA) 보간",
+    tips = ["체크한 채널이 포함된 항은 실수·허수(RI) 보간, 나머지 채널끼리의 항은 크기·위상(MA) 보간.\n"
+            "서로 결합된 포트(최대 |S| 0.01 이상)는 한 묶음으로 함께 체크됩니다.\n"
+            "같은 전원망의 포트에 두 방식을 섞으면 가짜 저항이 생기기 때문입니다.",
             "포트 탭의 전체 목록 순서. 출력 체크한 포트만 저장 시 1부터 다시 번호를 붙입니다.", "저장될 채널명",
             "지점을 추가하는 구간에서 인접한 원본 지점 사이의 최대 위상 변화 (크기 0.01 이상인 항).\n"
             f"{PHASE_LIMIT:g}°를 넘으면 RI 보간이 지점 사이의 크기를 줄입니다."]
@@ -60,6 +62,8 @@ class ChannelModel(QAbstractTableModel):
         self.checked = set()
         # Largest angle step per source port for the current plan; None before the data is loaded.
         self.steps = None
+        # Group label per source port; coupled ports share a label and one interpolation.
+        self.groups = None
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.ports)
@@ -78,6 +82,12 @@ class ChannelModel(QAbstractTableModel):
     def step(self, port):
         return None if self.steps is None else float(self.steps[port.source_index - 1])
 
+    def partners(self, source):
+        """Return the source ports that share an interpolation with this one, itself included."""
+        if self.groups is None:
+            return [source]
+        return (np.flatnonzero(self.groups == self.groups[source - 1]) + 1).tolist()
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
@@ -86,6 +96,12 @@ class ChannelModel(QAbstractTableModel):
         if column == 0:
             if role == Qt.CheckStateRole:
                 return Qt.Checked if port.source_index in self.checked else Qt.Unchecked
+            if role == Qt.ToolTipRole:
+                partners = set(self.partners(port.source_index)) - {port.source_index}
+                names = [other.name for other in self.ports if other.source_index in partners]
+                if names:
+                    shown = ", ".join(names[:6]) + (f" 외 {len(names) - 6}개" if len(names) > 6 else "")
+                    return f"결합된 포트와 함께 체크됩니다: {shown}"
             return None
         if column == 3:
             step = self.step(port)
@@ -132,9 +148,16 @@ class ChannelModel(QAbstractTableModel):
         self.steps = steps
         self.changed(3)
 
+    def set_groups(self, groups):
+        """Set the coupling groups; a group with any checked port becomes checked as a whole."""
+        self.groups = groups
+        self.set_checked(sorted(self.checked), True)
+
     def set_checked(self, sources, state):
         before = set(self.checked)
-        self.checked = self.checked | set(sources) if state else self.checked - set(sources)
+        # A coupled group changes together: splitting it would mix two interpolations in one network.
+        sources = {partner for source in sources for partner in self.partners(source)}
+        self.checked = self.checked | sources if state else self.checked - sources
         if self.checked != before:
             self.changed(0)
             self.changed(3)
@@ -657,7 +680,7 @@ class InterpolationTab(QWidget):
         self.output_label.setText(
             f"출력 체크 {count} / {len(ports)}개" + (f" → .s{count}p" if count else " · 저장할 포트 없음")
             + " · 포트 탭의 ‘출력 포트’에서 변경\n"
-            + "그래프·검사는 전체 포트 기준입니다. 아래 RI 체크는 보간 방식만 지정합니다.")
+            + "그래프·검사는 전체 포트 기준입니다. 아래 RI 체크는 보간 방식만 지정하며, 결합된 포트는 함께 체크됩니다.")
         self.select_sources(selected)
         self.schedule()
 
@@ -682,6 +705,7 @@ class InterpolationTab(QWidget):
         ports = document.ports if document is not None else []
         self.model.checked = {port.source_index for port in ports}
         self.model.steps = None
+        self.model.groups = None
         self.model.set_ports(ports)
         self.plot.message = ""
         self.plot.set_data([], [])
@@ -731,8 +755,18 @@ class InterpolationTab(QWidget):
         self.generation += 1
         self.cache.clear()
         self.checks = self.check_key = self.check_wanted = None
+        self.model.set_groups(coupled_groups(network.coupling))
         self.stack.setCurrentIndex(1)
         self.refresh()
+
+    def polar_outputs(self):
+        """Return the output ports left on magnitude/angle although real/imaginary suits them.
+
+        Ports whose angle turns quickly between source points are left out: magnitude/angle is right for those.
+        """
+        return [port for port in self.model.ports
+                if port.included and port.source_index not in self.model.checked
+                and (self.model.step(port) or 0.0) <= PHASE_LIMIT]
 
     def can_export(self):
         return self.network is not None and self.plan is not None
@@ -840,6 +874,20 @@ class InterpolationTab(QWidget):
         checks = self.checks
         if not added:
             note("추가되는 지점이 없음. 구간이 원본 지점과 모두 겹침", True)
+        polar = self.polar_outputs()
+        if polar and added:
+            # What a tool's default interpolation would get wrong is written into these ports.
+            members = np.array([port.source_index - 1 for port in polar])
+            touched = touched_intervals(network, plan)
+            gap = float(network.differences[touched][:, members].max()) if len(touched) else 0.0
+            text = (f"출력 포트 {len(polar)}개가 크기·위상(MA) 보간: 결합 툴 기본 보간의 오차가 파일에 그대로 들어감 "
+                    f"(RI 대비 차이 최대 {gap:.2g}")
+            references = network.references[members]
+            if references.min() == references.max():
+                text += f", 기준 임피던스 곱 {engineering(references[0] * gap, 3)}Ω"
+            note(text + "). 비교용이 아니면 체크할 것", True)
+        if not ri_ports.any():
+            lines.append("RI 보간 채널 없음. 모든 항을 크기·위상으로 보간")
         if ri_ports.any():
             steps = np.where(ri_ports, self.model.steps, 0.0)
             steep = int((steps > PHASE_LIMIT).sum())
@@ -863,8 +911,6 @@ class InterpolationTab(QWidget):
                     if checks is not None:
                         text += f" → {engineering(references[0] * checks.remaining, 3)}Ω"
                 lines.append(text)
-        else:
-            lines.append("RI 보간 채널 없음. 모든 항을 크기·위상으로 보간")
         if network.matrices is None:
             lines.append("메모리 부족으로 추가 지점의 수동성·대칭성 점검 생략")
         elif checks is not None:

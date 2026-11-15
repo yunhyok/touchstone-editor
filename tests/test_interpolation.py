@@ -8,6 +8,7 @@ import pytest
 from touchstone_editor.core import CancelledError, option_settings, read_touchstone
 from touchstone_editor.interpolation import (DECADE_COUNT, DEFAULT_BANDS, LINEAR_AXIS, LINEAR_COUNT, LINEAR_STEP,
                                              LOG_AXIS, PHASE_LIMIT, Band, build_plan, check_plan, compute_traces,
+                                             coupled_groups,
                                              describe, export_interpolated, format_frequency, load_network,
                                              parse_frequency, s_to_z, touched_intervals)
 
@@ -499,6 +500,40 @@ def test_resampled_file_survives_a_second_magnitude_angle_interpolation(tmp_path
 
     assert worst(network) > 1.5 * 4e-3
     assert worst(resampled) == pytest.approx(4e-3, rel=0.02)
+
+
+def test_mixing_interpolations_inside_a_coupled_pair_invents_resistance(tmp_path):
+    """Real/imaginary on the DUT port alone leaves the LGA port's own term on magnitude/angle.
+    That one term is enough to bring the false resistance back, so coupled ports must be chosen together."""
+    source = 10 ** (np.arange(24, 57) / 8)
+    document = write(tmp_path / "source.s2p", touchstone(source, [lumped_block(f) for f in source], 1.0))
+    network = load_network(document)
+    # The two ports pass almost everything to each other at low frequency: one group.
+    assert network.coupling[0, 1] > 0.9 and network.coupling.shape == (2, 2)
+    assert coupled_groups(network.coupling).tolist() == [0, 0]
+    plan = build_plan([Band(1e3, 1e7, DECADE_COUNT, 100)], network.frequencies)
+
+    def worst(ri_ports, name):
+        target = tmp_path / name
+        export_interpolated(document, document.ports, target, network.frequencies, plan.frequencies, ri_ports)
+        result = load_network(read_touchstone(target))
+        inside = (result.frequencies >= 1e5) & (result.frequencies <= 1e6)
+        return max(series_resistance(matrix) for matrix, keep in zip(result.matrices, inside) if keep)
+
+    assert worst([True, True], "both.s2p") == pytest.approx(4e-3, rel=0.01)
+    assert worst([True, False], "dut_only.s2p") > 1.1 * 4e-3
+    assert worst([False, False], "neither.s2p") > 1.5 * 4e-3
+
+
+def test_coupling_groups_follow_the_largest_entry_between_ports():
+    coupling = np.zeros((6, 6))
+    coupling[0, 3] = 1.0          # a DUT port and its LGA port
+    coupling[4, 1] = 0.02         # linked in one direction only
+    coupling[2, 5] = 0.009        # below the limit
+    np.fill_diagonal(coupling, 0.99)
+    assert coupled_groups(coupling).tolist() == [0, 1, 2, 0, 1, 3]
+    assert coupled_groups(coupling, limit=0.005).tolist() == [0, 1, 2, 0, 1, 2]
+    assert coupled_groups(np.zeros((0, 0))).tolist() == []
 
 
 def test_load_measures_angle_steps_and_the_interpolation_gap(tmp_path):

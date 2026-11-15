@@ -680,6 +680,15 @@ class MainWindow(QMainWindow):
             return
         bands, plan, ri_ports, axis = self.interpolation.export_request()
         source, targets = self.interpolation.network.frequencies, plan.frequencies
+        polar = self.interpolation.polar_outputs()
+        if polar and QMessageBox.question(
+                self, "크기·위상(MA) 보간 포함",
+                f"출력 포트 {len(polar)}개가 RI 보간 대상이 아니어서 크기·위상(MA)으로 보간됩니다.\n"
+                "결합 툴의 기본 보간이 만드는 가짜 공진이 파일에 그대로 들어가며, "
+                "INTDATTYP=RI를 지정해도 없어지지 않습니다.\n\n"
+                "비교용 파일이 아니라면 ‘아니요’를 누르고 보간 탭에서 해당 채널을 체크하세요.\n\n그대로 저장할까요?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
         target = self.choose_target("_interp", "보간 결과 저장")
         if target is None:
             return
